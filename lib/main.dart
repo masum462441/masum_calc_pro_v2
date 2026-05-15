@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -15,7 +17,16 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp();
+
+  try {
+    await Firebase.initializeApp().timeout(const Duration(seconds: 8));
+    AuthBackupService.firebaseReady = true;
+  } catch (e) {
+    // App must open even if Firebase web/android config is missing or internet is slow.
+    AuthBackupService.firebaseReady = false;
+    debugPrint('Firebase init skipped: $e');
+  }
+
   runApp(const MasumCalcApp());
 }
 
@@ -64,7 +75,10 @@ class _CalculatorRootState extends State<CalculatorRoot> {
       themeMode: darkMode ? ThemeMode.dark : ThemeMode.light,
       darkTheme: ThemeData.dark(useMaterial3: true),
       theme: ThemeData.light(useMaterial3: true),
-      home: CalculatorPage(darkMode: darkMode, onThemeChanged: changeTheme),
+      home: PinLockGate(
+        darkMode: darkMode,
+        child: CalculatorPage(darkMode: darkMode, onThemeChanged: changeTheme),
+      ),
     );
   }
 }
@@ -181,32 +195,78 @@ Future<void> saveSmartToolHistoryList(List<SmartToolHistoryItem> items) async {
 }
 
 class AuthBackupService {
-  static final FirebaseAuth _auth = FirebaseAuth.instance;
-  static final FirebaseFirestore _db = FirebaseFirestore.instance;
+  static bool firebaseReady = false;
   static Timer? _autoBackupTimer;
   static bool _autoBackupRunning = false;
 
-  static User? get currentUser => _auth.currentUser;
-  static Stream<User?> get authChanges => _auth.authStateChanges();
+  static FirebaseAuth? get _auth {
+    if (!firebaseReady) return null;
+    try {
+      return FirebaseAuth.instance;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static FirebaseFirestore? get _db {
+    if (!firebaseReady) return null;
+    try {
+      return FirebaseFirestore.instance;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static User? get currentUser {
+    final auth = _auth;
+    if (auth == null) return null;
+    try {
+      return auth.currentUser;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Stream<User?> get authChanges {
+    final auth = _auth;
+    if (auth == null) return Stream<User?>.value(null);
+    try {
+      return auth.authStateChanges();
+    } catch (_) {
+      return Stream<User?>.value(null);
+    }
+  }
 
   static void scheduleAutoBackup() {
-    if (currentUser == null) return;
+    if (!firebaseReady || currentUser == null) return;
     _autoBackupTimer?.cancel();
     _autoBackupTimer = Timer(const Duration(seconds: 2), () async {
-      if (_autoBackupRunning || currentUser == null) return;
+      if (_autoBackupRunning || !firebaseReady || currentUser == null) return;
       _autoBackupRunning = true;
       try {
         await backupLocalData();
       } catch (_) {
-        // Keep the app fast and silent if internet is off. Manual Backup still shows errors.
+        // Keep the app fast and silent if internet/firebase is off.
       } finally {
         _autoBackupRunning = false;
       }
     });
   }
 
-  static Future<User?> signInWithGoogle() async {
-    final googleUser = await GoogleSignIn().signIn();
+  static Future<User?> signInWithGoogle({bool forceAccountPicker = false}) async {
+    final auth = _auth;
+    if (auth == null) {
+      throw Exception('Firebase is not ready. Check Firebase web config first.');
+    }
+
+    final googleSignIn = GoogleSignIn();
+    if (forceAccountPicker) {
+      try {
+        await googleSignIn.signOut();
+      } catch (_) {}
+    }
+
+    final googleUser = await googleSignIn.signIn();
     if (googleUser == null) return null;
 
     final googleAuth = await googleUser.authentication;
@@ -215,14 +275,17 @@ class AuthBackupService {
       idToken: googleAuth.idToken,
     );
 
-    final result = await _auth.signInWithCredential(credential);
+    final result = await auth.signInWithCredential(credential);
     return result.user;
   }
 
   static Future<void> signOut() async {
     _autoBackupTimer?.cancel();
-    await GoogleSignIn().signOut();
-    await _auth.signOut();
+    try {
+      await GoogleSignIn().signOut();
+    } catch (_) {}
+    final auth = _auth;
+    if (auth != null) await auth.signOut();
   }
 
   static Future<Map<String, dynamic>> _collectLocalData() async {
@@ -233,21 +296,38 @@ class AuthBackupService {
       'saved_calculations': prefs.getStringList('saved_calculations') ?? <String>[],
       'auto_history': prefs.getStringList('auto_history') ?? <String>[],
       'smart_tool_history': prefs.getStringList('smart_tool_history') ?? <String>[],
+      'customer_notebook': prefs.getStringList('customer_notebook') ?? <String>[],
+      'due_payment_records': prefs.getStringList('due_payment_records') ?? <String>[],
+      'daily_cashbook_entries': prefs.getStringList('daily_cashbook_entries') ?? <String>[],
+      'followup_reminders': prefs.getStringList('followup_reminders') ?? <String>[],
+      'receipt_memos': prefs.getStringList('receipt_memos') ?? <String>[],
+      'business_profile': prefs.getString('business_profile') ?? '',
+      'pin_lock_enabled': prefs.getBool('pin_lock_enabled') ?? false,
+      'pin_lock_hash': prefs.getString('pin_lock_hash') ?? '',
+      'pin_lock_salt': prefs.getString('pin_lock_salt') ?? '',
+      'pin_recovery_code_hash': prefs.getString('pin_recovery_code_hash') ?? '',
+      'pin_recovery_code_salt': prefs.getString('pin_recovery_code_salt') ?? '',
+      'pin_recovery_phone': prefs.getString('pin_recovery_phone') ?? '',
+      'pin_recovery_phone_verified': prefs.getBool('pin_recovery_phone_verified') ?? false,
+      'pin_recovery_email': prefs.getString('pin_recovery_email') ?? '',
+      'pin_recovery_uid': prefs.getString('pin_recovery_uid') ?? '',
       'updatedAt': FieldValue.serverTimestamp(),
     };
   }
 
   static Future<void> backupLocalData() async {
     final user = currentUser;
-    if (user == null) throw Exception('Please sign in first');
+    final db = _db;
+    if (user == null || db == null) throw Exception('Please sign in first');
     final data = await _collectLocalData();
-    await _db.collection('user_backups').doc(user.uid).set(data, SetOptions(merge: true));
+    await db.collection('user_backups').doc(user.uid).set(data, SetOptions(merge: true));
   }
 
   static Future<bool> restoreCloudData() async {
     final user = currentUser;
-    if (user == null) throw Exception('Please sign in first');
-    final doc = await _db.collection('user_backups').doc(user.uid).get();
+    final db = _db;
+    if (user == null || db == null) throw Exception('Please sign in first');
+    final doc = await db.collection('user_backups').doc(user.uid).get();
     if (!doc.exists) return false;
 
     final data = doc.data() ?? <String, dynamic>{};
@@ -258,6 +338,21 @@ class AuthBackupService {
     await prefs.setStringList('saved_calculations', List<String>.from(data['saved_calculations'] ?? const <String>[]));
     await prefs.setStringList('auto_history', List<String>.from(data['auto_history'] ?? const <String>[]));
     await prefs.setStringList('smart_tool_history', List<String>.from(data['smart_tool_history'] ?? const <String>[]));
+    await prefs.setStringList('customer_notebook', List<String>.from(data['customer_notebook'] ?? const <String>[]));
+    await prefs.setStringList('due_payment_records', List<String>.from(data['due_payment_records'] ?? const <String>[]));
+    await prefs.setStringList('daily_cashbook_entries', List<String>.from(data['daily_cashbook_entries'] ?? const <String>[]));
+    await prefs.setStringList('followup_reminders', List<String>.from(data['followup_reminders'] ?? const <String>[]));
+    await prefs.setStringList('receipt_memos', List<String>.from(data['receipt_memos'] ?? const <String>[]));
+    await prefs.setString('business_profile', data['business_profile'] ?? '');
+    await prefs.setBool('pin_lock_enabled', data['pin_lock_enabled'] == true);
+    await prefs.setString('pin_lock_hash', data['pin_lock_hash'] ?? '');
+    await prefs.setString('pin_lock_salt', data['pin_lock_salt'] ?? '');
+    await prefs.setString('pin_recovery_code_hash', data['pin_recovery_code_hash'] ?? '');
+    await prefs.setString('pin_recovery_code_salt', data['pin_recovery_code_salt'] ?? '');
+    await prefs.setString('pin_recovery_phone', data['pin_recovery_phone'] ?? '');
+    await prefs.setBool('pin_recovery_phone_verified', data['pin_recovery_phone_verified'] == true);
+    await prefs.setString('pin_recovery_email', data['pin_recovery_email'] ?? '');
+    await prefs.setString('pin_recovery_uid', data['pin_recovery_uid'] ?? '');
     return true;
   }
 }
@@ -274,16 +369,282 @@ String safePdfFileName(String value) {
   return cleaned.isEmpty ? 'masum_report.pdf' : 'masum_${cleaned}_report.pdf';
 }
 
+String generateSecuritySalt() => '${DateTime.now().microsecondsSinceEpoch}_${Random().nextInt(999999)}';
+
+String masumSecureHash(String value, String salt) {
+  var hash = 2166136261;
+  final input = utf8.encode('$salt|$value|masum_smart_calculator_pro');
+  for (int round = 0; round < 12; round++) {
+    for (final byte in input) {
+      hash ^= byte;
+      hash = (hash * 16777619) & 0x7fffffff;
+      hash ^= (hash >> 13);
+    }
+  }
+  return base64Url.encode(utf8.encode('$hash:$salt'));
+}
+
+String generateRecoveryCode() {
+  final r = Random.secure();
+  String part() => (1000 + r.nextInt(9000)).toString();
+  return 'MASUM-${part()}-${part()}';
+}
+
+Future<bool> verifySavedPinCode(String pin) async {
+  final prefs = await SharedPreferences.getInstance();
+  final oldRawPin = prefs.getString('pin_lock_code') ?? '';
+  if (oldRawPin.isNotEmpty && pin == oldRawPin) return true;
+  final salt = prefs.getString('pin_lock_salt') ?? '';
+  final hash = prefs.getString('pin_lock_hash') ?? '';
+  return salt.isNotEmpty && hash.isNotEmpty && masumSecureHash(pin, salt) == hash;
+}
+
+
+String normalizeBangladeshPhone(String phone) {
+  var p = phone.trim().replaceAll(RegExp(r'[^0-9+]'), '');
+  if (p.startsWith('+')) return p;
+  if (p.startsWith('880')) return '+$p';
+  if (p.startsWith('0') && p.length >= 11) return '+88$p';
+  return p;
+}
+
+Future<void> masumInfoDialog(BuildContext context, String title, String message) async {
+  if (!context.mounted) return;
+  await showDialog<void>(
+    context: context,
+    barrierDismissible: true,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(title),
+      content: Text(message),
+      actions: [TextButton(onPressed: () => Navigator.of(dialogContext).pop(), child: const Text('OK'))],
+    ),
+  );
+}
+
+Future<String?> masumInputDialog(
+  BuildContext context, {
+  required String title,
+  required String hint,
+  bool pin = false,
+  TextInputType? keyboardType,
+  int? maxLength,
+  String initialValue = '',
+}) async {
+  if (!context.mounted) return null;
+  final controller = TextEditingController(text: initialValue);
+  String? output;
+  try {
+    output = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          obscureText: pin,
+          keyboardType: keyboardType ?? (pin ? TextInputType.number : TextInputType.text),
+          maxLength: maxLength ?? (pin ? 4 : null),
+          textInputAction: TextInputAction.done,
+          decoration: InputDecoration(hintText: hint, counterText: maxLength != null || pin ? '' : null),
+          onSubmitted: (_) {
+            FocusScope.of(dialogContext).unfocus();
+            Navigator.of(dialogContext).pop(controller.text.trim());
+          },
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              FocusScope.of(dialogContext).unfocus();
+              Navigator.of(dialogContext).pop(null);
+            },
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              FocusScope.of(dialogContext).unfocus();
+              Navigator.of(dialogContext).pop(controller.text.trim());
+            },
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+  } finally {
+    // Delay dispose so Flutter text input/keyboard can detach safely.
+    // This prevents: '_dependents.isEmpty' red screen on some Android keyboards.
+    Future.delayed(const Duration(milliseconds: 700), () {
+      try {
+        controller.dispose();
+      } catch (_) {}
+    });
+  }
+  await Future.delayed(const Duration(milliseconds: 260));
+  return output;
+}
+
+Future<void> masumApplyPhoneCredential(PhoneAuthCredential credential) async {
+  final auth = FirebaseAuth.instance;
+  final current = auth.currentUser;
+  if (current != null) {
+    try {
+      await current.linkWithCredential(credential);
+      return;
+    } on FirebaseAuthException catch (e) {
+      if (e.code == 'provider-already-linked') return;
+      if (e.code == 'credential-already-in-use' || e.code == 'email-already-in-use') {
+        await auth.signInWithCredential(credential);
+        return;
+      }
+      rethrow;
+    }
+  }
+  await auth.signInWithCredential(credential);
+}
+
+Future<bool> verifyPhoneOtpWithFirebase(BuildContext context, String rawPhone) async {
+  final phone = normalizeBangladeshPhone(rawPhone);
+  if (phone.isEmpty || !phone.startsWith('+')) {
+    await masumInfoDialog(context, 'Invalid phone number', 'Phone number country code সহ দাও। Bangladesh হলে 01 দিয়ে দিলেও app +88 করে নিবে। Example: 01306719179');
+    return false;
+  }
+  if (!AuthBackupService.firebaseReady) {
+    await masumInfoDialog(context, 'Firebase not ready', 'Phone OTP চালাতে Firebase ready থাকতে হবে। android/app/google-services.json এবং internet check করো।');
+    return false;
+  }
+
+  final completer = Completer<bool>();
+  try {
+    await FirebaseAuth.instance.verifyPhoneNumber(
+      phoneNumber: phone,
+      timeout: const Duration(seconds: 60),
+      verificationCompleted: (PhoneAuthCredential credential) async {
+        try {
+          await masumApplyPhoneCredential(credential);
+          if (!completer.isCompleted) completer.complete(true);
+        } catch (e) {
+          if (!completer.isCompleted) completer.completeError(e);
+        }
+      },
+      verificationFailed: (FirebaseAuthException e) {
+        if (!completer.isCompleted) completer.completeError(e.message ?? e.code);
+      },
+      codeSent: (String verificationId, int? resendToken) async {
+        final smsCode = await masumInputDialog(
+          context,
+          title: 'Enter OTP',
+          hint: '6 digit SMS code',
+          keyboardType: TextInputType.number,
+          maxLength: 6,
+        );
+        if (smsCode == null || smsCode.trim().isEmpty) {
+          if (!completer.isCompleted) completer.complete(false);
+          return;
+        }
+        try {
+          final credential = PhoneAuthProvider.credential(verificationId: verificationId, smsCode: smsCode.trim());
+          await masumApplyPhoneCredential(credential);
+          if (!completer.isCompleted) completer.complete(true);
+        } catch (e) {
+          if (!completer.isCompleted) completer.completeError(e);
+        }
+      },
+      codeAutoRetrievalTimeout: (String verificationId) {},
+    );
+    return await completer.future.timeout(const Duration(seconds: 75), onTimeout: () => false);
+  } catch (e) {
+    if (context.mounted) {
+      await masumInfoDialog(context, 'Phone OTP failed', 'OTP verify করা যায়নি: $e\n\nFirebase Console → Authentication → Sign-in method → Phone enable আছে কিনা দেখো।');
+    }
+    return false;
+  }
+}
+
+
+bool hasBanglaText(String value) => RegExp(r'[\u0980-\u09FF]').hasMatch(value);
+
+Future<Uint8List?> renderBanglaTextPng(
+  String text, {
+  bool bold = false,
+  double fontSize = 22,
+  double maxWidth = 980,
+}) async {
+  try {
+    final safeText = text.isEmpty ? ' ' : text;
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: safeText,
+        style: TextStyle(
+          color: Colors.black,
+          fontSize: fontSize,
+          fontWeight: bold ? FontWeight.w800 : FontWeight.w500,
+          height: 1.35,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+      maxLines: null,
+    )..layout(maxWidth: maxWidth);
+
+    const padding = 10.0;
+    final imageWidth = (textPainter.width + padding * 2).ceil().clamp(1, 1400);
+    final imageHeight = (textPainter.height + padding * 2).ceil().clamp(1, 800);
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder, Rect.fromLTWH(0, 0, imageWidth.toDouble(), imageHeight.toDouble()));
+    textPainter.paint(canvas, const Offset(padding, padding));
+
+    final picture = recorder.endRecording();
+    final image = await picture.toImage(imageWidth, imageHeight);
+    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+    return byteData?.buffer.asUint8List();
+  } catch (_) {
+    return null;
+  }
+}
+
+Future<pw.ThemeData?> masumPdfBanglaTheme() async {
+  try {
+    final regularFont = await PdfGoogleFonts.notoSansBengaliRegular();
+    final boldFont = await PdfGoogleFonts.notoSansBengaliBold();
+    return pw.ThemeData.withFont(
+      base: regularFont,
+      bold: boldFont,
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
 Future<void> exportTextPdf(BuildContext context, {required String title, required String text, String? fileName}) async {
   try {
     final pdf = pw.Document();
+    final pdfTheme = await masumPdfBanglaTheme();
     final now = DateTime.now();
     final lines = text.split('\n');
+
+    // Bengali conjuncts like পঞ্চান্ন can look broken in some Android PDF viewers
+    // when written as normal PDF text. For Bangla lines we render the line with
+    // Flutter's text engine first, then place it inside the PDF as a crisp image.
+    // This keeps app display + PDF display visually the same.
+    final banglaLineImages = <int, Uint8List>{};
+    for (int index = 0; index < lines.length; index++) {
+      final line = lines[index];
+      if (!hasBanglaText(line)) continue;
+      final isHeader = line.trim().isNotEmpty && !line.contains(':') && line.length < 45;
+      final image = await renderBanglaTextPng(
+        line.isEmpty ? ' ' : line,
+        bold: isHeader,
+        fontSize: isHeader ? 28 : 22,
+        maxWidth: 980,
+      );
+      if (image != null) banglaLineImages[index] = image;
+    }
 
     pdf.addPage(
       pw.MultiPage(
         pageFormat: PdfPageFormat.a4,
         margin: const pw.EdgeInsets.all(28),
+        theme: pdfTheme,
         build: (pw.Context pdfContext) => [
           pw.Container(
             width: double.infinity,
@@ -304,19 +665,23 @@ Future<void> exportTextPdf(BuildContext context, {required String title, require
             ),
           ),
           pw.SizedBox(height: 18),
-          ...lines.map((line) {
+          ...List.generate(lines.length, (index) {
+            final line = lines[index];
             final isHeader = line.trim().isNotEmpty && !line.contains(':') && line.length < 45;
+            final banglaImage = banglaLineImages[index];
             return pw.Padding(
               padding: const pw.EdgeInsets.only(bottom: 6),
-              child: pw.Text(
-                line.isEmpty ? ' ' : line,
-                style: pw.TextStyle(
-                  fontSize: isHeader ? 14 : 11,
-                  fontWeight: isHeader ? pw.FontWeight.bold : pw.FontWeight.normal,
-                  color: PdfColor.fromHex('#071323'),
-                  lineSpacing: 3,
-                ),
-              ),
+              child: banglaImage != null
+                  ? pw.Image(pw.MemoryImage(banglaImage), width: 500)
+                  : pw.Text(
+                      line.isEmpty ? ' ' : line,
+                      style: pw.TextStyle(
+                        fontSize: isHeader ? 14 : 11,
+                        fontWeight: isHeader ? pw.FontWeight.bold : pw.FontWeight.normal,
+                        color: PdfColor.fromHex('#071323'),
+                        lineSpacing: 3,
+                      ),
+                    ),
             );
           }),
           pw.SizedBox(height: 16),
@@ -456,22 +821,26 @@ class _CalculatorPageState extends State<CalculatorPage> {
   bool banglaWord = false;
   bool scientificMode = false;
   bool degreeMode = true;
+  bool secondMode = false;
+  double memoryValue = 0;
   final List<String> miniHistory = [];
   final List<AutoHistoryItem> autoHistory = [];
   final List<SavedCalculation> savedItems = [];
   User? firebaseUser;
   StreamSubscription<User?>? authSub;
 
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get card => widget.darkMode ? const Color(0xFF0E1B2C) : Colors.white;
-  Color get card2 => widget.darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB);
-  Color get numBtn => widget.darkMode ? const Color(0xFF18293D) : const Color(0xFFE7EEF7);
-  Color get opBtn => widget.darkMode ? const Color(0xFF0FAEC6) : const Color(0xFF0EAFC4);
-  Color get dangerBtn => const Color(0xFFFF8A00);
-  Color get equalBtn => const Color(0xFF7C4DFF);
-  Color get sciBtn => widget.darkMode ? const Color(0xFF26304A) : const Color(0xFFDCE6F6);
-  Color get mainTextColor => widget.darkMode ? Colors.white : const Color(0xFF071323);
-  Color get mutedTextColor => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
+  // Human-made matte palette: AMOLED background, iPhone-style orange operators,
+  // charcoal number keys, soft grey action keys. No heavy neon glow.
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F4F5);
+  Color get card => widget.darkMode ? const Color(0xFF111214) : Colors.white;
+  Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8E8ED);
+  Color get numBtn => widget.darkMode ? const Color(0xFF2C2C2E) : const Color(0xFFE5E5EA);
+  Color get opBtn => const Color(0xFFFF9F0A);
+  Color get dangerBtn => widget.darkMode ? const Color(0xFFA5A5A5) : const Color(0xFFD1D1D6);
+  Color get equalBtn => const Color(0xFFFF9F0A);
+  Color get sciBtn => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFD1D1D6);
+  Color get mainTextColor => widget.darkMode ? Colors.white : const Color(0xFF111111);
+  Color get mutedTextColor => widget.darkMode ? const Color(0xFF8E8E93) : const Color(0xFF5F6368);
 
   @override
   void initState() {
@@ -514,7 +883,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
     AuthBackupService.scheduleAutoBackup();
   }
 
-  bool isOperator(String v) => v == '+' || v == '-' || v == '×' || v == '÷' || v == '%' || v == '^';
+  bool isOperator(String v) => v == '+' || v == '-' || v == '×' || v == '÷' || v == '^';
 
   void updateWordText() {
     final value = double.tryParse(result) ?? 0;
@@ -561,13 +930,65 @@ class _CalculatorPageState extends State<CalculatorPage> {
     );
   }
 
+  void exportCalculatorPdfDirect() {
+    HapticFeedback.lightImpact();
+    final exp = expression.trim().isEmpty ? '0' : expression.trim();
+    exportTextPdf(
+      context,
+      title: 'Calculator Result',
+      text: 'Calculation: $exp\nResult: $result\n$wordText',
+      fileName: 'masum_calculator_result_report.pdf',
+    );
+  }
+
   void press(String v) {
     HapticFeedback.selectionClick();
     setState(() {
-      if (v == 'C') {
+      if (v == 'C' || v == 'AC') {
         expression = '';
         result = '0';
         updateWordText();
+        return;
+      }
+      if (v == '2nd') {
+        secondMode = !secondMode;
+        return;
+      }
+      if (v == 'mc') {
+        memoryValue = 0;
+        return;
+      }
+      if (v == 'm+') {
+        final current = double.tryParse(result);
+        if (current != null) memoryValue += current;
+        return;
+      }
+      if (v == 'm-') {
+        final current = double.tryParse(result);
+        if (current != null) memoryValue -= current;
+        return;
+      }
+      if (v == 'mr') {
+        expression += format(memoryValue);
+        liveCalc();
+        return;
+      }
+      if (v == 'Rand') {
+        expression = Random().nextDouble().toStringAsFixed(6);
+        liveCalc();
+        return;
+      }
+      if (v == '+/-') {
+        if (expression.isEmpty || expression == '0') {
+          expression = result == '0' ? '0' : '-($result)';
+        } else if (expression.startsWith('-(') && expression.endsWith(')')) {
+          expression = expression.substring(2, expression.length - 1);
+        } else if (expression.startsWith('-')) {
+          expression = expression.substring(1);
+        } else {
+          expression = '-($expression)';
+        }
+        liveCalc();
         return;
       }
       if (v == '⌫') {
@@ -579,12 +1000,16 @@ class _CalculatorPageState extends State<CalculatorPage> {
         finalCalc();
         return;
       }
-      if (v == 'deg') {
+      if (v == 'deg' || v == 'Deg') {
         degreeMode = !degreeMode;
         liveCalc();
         return;
       }
-      if (['sin', 'cos', 'tan', 'log', 'ln'].contains(v)) {
+      if (v == 'log₁₀') {
+        expression += 'log(';
+        return;
+      }
+      if (['sin', 'cos', 'tan', 'sinh', 'cosh', 'tanh', 'log', 'ln'].contains(v)) {
         expression += '$v(';
         return;
       }
@@ -597,8 +1022,59 @@ class _CalculatorPageState extends State<CalculatorPage> {
         liveCalc();
         return;
       }
+      if (v == 'x³') {
+        if (expression.isNotEmpty) expression += '^3';
+        liveCalc();
+        return;
+      }
       if (v == 'xʸ') {
         if (expression.isNotEmpty) expression += '^';
+        return;
+      }
+      if (v == 'eˣ') {
+        if (expression.isNotEmpty) {
+          expression = '${e.toString()}^($expression)';
+          liveCalc();
+        } else {
+          expression = '${e.toString()}^(';
+        }
+        return;
+      }
+      if (v == '10ˣ') {
+        if (expression.isNotEmpty) {
+          expression = '10^($expression)';
+          liveCalc();
+        } else {
+          expression = '10^(';
+        }
+        return;
+      }
+      if (v == '²√x') {
+        if (expression.isNotEmpty) {
+          expression = '√($expression)';
+          liveCalc();
+        } else {
+          expression += '√(';
+        }
+        return;
+      }
+      if (v == '³√x') {
+        if (expression.isNotEmpty) {
+          expression = '($expression)^(1÷3)';
+          liveCalc();
+        }
+        return;
+      }
+      if (v == 'ʸ√x') {
+        if (expression.isNotEmpty) expression += '^(1÷';
+        return;
+      }
+      if (v == 'EE') {
+        if (expression.isEmpty) {
+          expression = '10^';
+        } else {
+          expression += '×10^';
+        }
         return;
       }
       if (v == 'x!') {
@@ -618,6 +1094,14 @@ class _CalculatorPageState extends State<CalculatorPage> {
       }
       if (v == 'e') {
         expression += e.toString();
+        liveCalc();
+        return;
+      }
+      if (v == '%') {
+        if (expression.isEmpty) return;
+        final last = expression[expression.length - 1];
+        if (isOperator(last) || last == '(' || last == '.' || last == '%') return;
+        expression += '%';
         liveCalc();
         return;
       }
@@ -727,23 +1211,29 @@ class _CalculatorPageState extends State<CalculatorPage> {
     );
   }
 
-  Widget premiumButton(String text, Color color, double fontSize) {
+  Widget premiumButton(String text, Color color, double fontSize, {bool scientificPanel = false}) {
     final isEqual = text == '=';
-    final isDanger = text == 'C' || text == '⌫';
-    final isOperatorBtn = ['+', '-', '×', '÷', '%', '√', 'x²', 'π', '(', ')'].contains(text);
-    final isScienceBtn = ['xʸ', 'deg', 'sin', 'cos', 'tan', 'log', 'ln', 'x!', '1/x', 'e'].contains(text);
+    final isDanger = text == 'C' || text == 'AC' || text == '⌫';
+    final isOperatorBtn = scientificPanel
+        ? ['+', '-', '×', '÷'].contains(text)
+        : ['+', '-', '×', '÷', '%', '√', 'x²', 'π', '(', ')'].contains(text);
+    final isScienceBtn = [
+      '2nd', 'xʸ', 'Deg', 'deg', 'sin', 'cos', 'tan', 'sinh', 'cosh', 'tanh',
+      'log', 'log₁₀', 'ln', 'x!', '1/x', 'e', 'Rand', 'mc', 'm+', 'm-', 'mr',
+      'x³', 'eˣ', '10ˣ', '²√x', '³√x', 'ʸ√x', 'EE', '+/-', 'π', '(', ')', '%'
+    ].contains(text);
     late Color topColor, bottomColor, borderColor, textColor, glowColor;
 
     if (isEqual) {
-      topColor = const Color(0xFF9A6BFF); bottomColor = const Color(0xFF6A3DFF); borderColor = const Color(0xFFBFA8FF).withOpacity(0.35); textColor = Colors.white; glowColor = const Color(0xFF7C4DFF);
+      topColor = const Color(0xFFFFB143); bottomColor = const Color(0xFFFF9500); borderColor = Colors.white.withOpacity(0.10); textColor = Colors.white; glowColor = Colors.black;
     } else if (isDanger) {
-      topColor = const Color(0xFFFFA733); bottomColor = const Color(0xFFFF7C00); borderColor = const Color(0xFFFFD39A).withOpacity(0.35); textColor = Colors.white; glowColor = const Color(0xFFFF8A00);
+      topColor = widget.darkMode ? const Color(0xFFB8B8B8) : const Color(0xFFDADADA); bottomColor = widget.darkMode ? const Color(0xFF9B9B9B) : const Color(0xFFC7C7CC); borderColor = Colors.white.withOpacity(0.08); textColor = const Color(0xFF101010); glowColor = Colors.black;
     } else if (isOperatorBtn) {
-      topColor = const Color(0xFF27D0E4); bottomColor = const Color(0xFF0796AE); borderColor = const Color(0xFFA8F7FF).withOpacity(0.30); textColor = Colors.white; glowColor = const Color(0xFF00D4FF);
+      topColor = const Color(0xFFFFB143); bottomColor = const Color(0xFFFF9500); borderColor = Colors.white.withOpacity(0.09); textColor = Colors.white; glowColor = Colors.black;
     } else if (isScienceBtn) {
-      topColor = widget.darkMode ? const Color(0xFF303B56) : const Color(0xFFF4F8FF); bottomColor = widget.darkMode ? const Color(0xFF202A40) : const Color(0xFFDDE9F7); borderColor = widget.darkMode ? Colors.white.withOpacity(0.10) : Colors.white.withOpacity(0.75); textColor = widget.darkMode ? Colors.white : const Color(0xFF071323); glowColor = const Color(0xFF6A7BFF);
+      topColor = widget.darkMode ? const Color(0xFF242426) : const Color(0xFFE1E1E5); bottomColor = widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFD1D1D6); borderColor = widget.darkMode ? Colors.white.withOpacity(0.06) : Colors.black.withOpacity(0.04); textColor = widget.darkMode ? Colors.white : const Color(0xFF111111); glowColor = Colors.black;
     } else {
-      topColor = widget.darkMode ? const Color(0xFF243A55) : Colors.white; bottomColor = widget.darkMode ? const Color(0xFF172A41) : const Color(0xFFE7F0FA); borderColor = widget.darkMode ? Colors.white.withOpacity(0.10) : Colors.white.withOpacity(0.85); textColor = widget.darkMode ? Colors.white : const Color(0xFF071323); glowColor = widget.darkMode ? const Color(0xFF193B5C) : const Color(0xFFB8D7F3);
+      topColor = widget.darkMode ? const Color(0xFF333335) : Colors.white; bottomColor = widget.darkMode ? const Color(0xFF2C2C2E) : const Color(0xFFE5E5EA); borderColor = widget.darkMode ? Colors.white.withOpacity(0.06) : Colors.black.withOpacity(0.04); textColor = widget.darkMode ? Colors.white : const Color(0xFF111111); glowColor = Colors.black;
     }
 
     return Expanded(
@@ -760,14 +1250,14 @@ class _CalculatorPageState extends State<CalculatorPage> {
               gradient: LinearGradient(colors: [topColor, bottomColor], begin: Alignment.topLeft, end: Alignment.bottomRight),
               border: Border.all(color: borderColor, width: 1),
               boxShadow: [
-                BoxShadow(color: glowColor.withOpacity(widget.darkMode ? 0.26 : 0.16), blurRadius: isEqual ? 22 : 13, offset: const Offset(0, 5)),
-                BoxShadow(color: Colors.black.withOpacity(widget.darkMode ? 0.28 : 0.10), blurRadius: 12, offset: const Offset(0, 8)),
+                BoxShadow(color: glowColor.withOpacity(widget.darkMode ? 0.22 : 0.08), blurRadius: 10, offset: const Offset(0, 5)),
+                BoxShadow(color: Colors.white.withOpacity(widget.darkMode ? 0.015 : 0.10), blurRadius: 1, offset: const Offset(0, -1)),
               ],
             ),
             child: Stack(
               children: [
-                Positioned(top: 5, left: 11, right: 11, child: Container(height: 18, decoration: BoxDecoration(borderRadius: BorderRadius.circular(20), gradient: LinearGradient(colors: [Colors.white.withOpacity(isOperatorBtn || isDanger || isEqual ? 0.16 : 0.07), Colors.white.withOpacity(0)], begin: Alignment.topCenter, end: Alignment.bottomCenter)))),
-                Center(child: text == '⌫' ? Icon(Icons.backspace_rounded, color: textColor, size: 22) : FittedBox(child: Text(text == 'deg' ? (degreeMode ? 'deg' : 'rad') : text, style: TextStyle(fontSize: fontSize, fontWeight: FontWeight.w900, color: textColor, shadows: [if (widget.darkMode) Shadow(color: Colors.black.withOpacity(0.30), blurRadius: 4, offset: const Offset(0, 1))])))),
+                Positioned(top: 5, left: 11, right: 11, child: Container(height: 14, decoration: BoxDecoration(borderRadius: BorderRadius.circular(20), gradient: LinearGradient(colors: [Colors.white.withOpacity(isOperatorBtn || isDanger || isEqual ? 0.10 : 0.04), Colors.white.withOpacity(0)], begin: Alignment.topCenter, end: Alignment.bottomCenter)))),
+                Center(child: text == '⌫' ? Icon(Icons.backspace_rounded, color: textColor, size: 22) : FittedBox(child: Text((text == 'deg' || text == 'Deg') ? (degreeMode ? 'Deg' : 'Rad') : text, style: TextStyle(fontSize: fontSize, fontWeight: FontWeight.w900, color: textColor, shadows: [if (widget.darkMode) Shadow(color: Colors.black.withOpacity(0.30), blurRadius: 4, offset: const Offset(0, 1))])))),
               ],
             ),
           ),
@@ -788,13 +1278,77 @@ class _CalculatorPageState extends State<CalculatorPage> {
       ];
 
   List<Widget> scientificButtons(double f) => [
-        buttonRow([premiumButton('xʸ', sciBtn, 14 * f), premiumButton('deg', sciBtn, 13 * f), premiumButton('sin', sciBtn, 14 * f), premiumButton('cos', sciBtn, 14 * f), premiumButton('tan', sciBtn, 14 * f)]),
-        buttonRow([premiumButton('√', sciBtn, 15 * f), premiumButton('log', sciBtn, 14 * f), premiumButton('ln', sciBtn, 14 * f), premiumButton('x!', sciBtn, 14 * f), premiumButton('1/x', sciBtn, 13 * f)]),
-        buttonRow([premiumButton('C', dangerBtn, 17 * f), premiumButton('⌫', dangerBtn, 17 * f), premiumButton('%', opBtn, 17 * f), premiumButton('÷', opBtn, 17 * f), premiumButton('×', opBtn, 17 * f)]),
-        buttonRow([premiumButton('π', sciBtn, 17 * f), premiumButton('7', numBtn, 17 * f), premiumButton('8', numBtn, 17 * f), premiumButton('9', numBtn, 17 * f), premiumButton('-', opBtn, 17 * f)]),
-        buttonRow([premiumButton('e', sciBtn, 17 * f), premiumButton('4', numBtn, 17 * f), premiumButton('5', numBtn, 17 * f), premiumButton('6', numBtn, 17 * f), premiumButton('+', opBtn, 17 * f)]),
-        buttonRow([premiumButton('1', numBtn, 17 * f), premiumButton('2', numBtn, 17 * f), premiumButton('3', numBtn, 17 * f), premiumButton(')', sciBtn, 17 * f), premiumButton('=', equalBtn, 17 * f)]),
-        buttonRow([premiumButton('(', sciBtn, 17 * f), premiumButton('0', numBtn, 17 * f), premiumButton('.', numBtn, 17 * f), premiumButton('+', opBtn, 17 * f), premiumButton('=', equalBtn, 17 * f)]),
+        // Scientific layout inspired by iPhone scientific calculator: all scientific keys visible.
+        buttonRow([
+          premiumButton('(', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton(')', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('mc', sciBtn, 11 * f, scientificPanel: true),
+          premiumButton('m+', sciBtn, 11 * f, scientificPanel: true),
+          premiumButton('m-', sciBtn, 11 * f, scientificPanel: true),
+          premiumButton('mr', sciBtn, 11 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('2nd', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('x²', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('x³', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('xʸ', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('eˣ', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('10ˣ', sciBtn, 11.5 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('1/x', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('²√x', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('³√x', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('ʸ√x', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('ln', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('log₁₀', sciBtn, 10.5 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('x!', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('sin', sciBtn, 11.5 * f, scientificPanel: true),
+          premiumButton('cos', sciBtn, 11.5 * f, scientificPanel: true),
+          premiumButton('tan', sciBtn, 11.5 * f, scientificPanel: true),
+          premiumButton('e', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('EE', sciBtn, 11.5 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('Rand', sciBtn, 9.8 * f, scientificPanel: true),
+          premiumButton('sinh', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('cosh', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('tanh', sciBtn, 10.5 * f, scientificPanel: true),
+          premiumButton('π', sciBtn, 12 * f, scientificPanel: true),
+          premiumButton('Deg', sciBtn, 10.5 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('⌫', dangerBtn, 16 * f, scientificPanel: true),
+          premiumButton('AC', dangerBtn, 16 * f, scientificPanel: true),
+          premiumButton('%', sciBtn, 16 * f, scientificPanel: true),
+          premiumButton('÷', opBtn, 17 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('7', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('8', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('9', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('×', opBtn, 17 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('4', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('5', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('6', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('-', opBtn, 17 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('1', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('2', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('3', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('+', opBtn, 17 * f, scientificPanel: true),
+        ]),
+        buttonRow([
+          premiumButton('+/-', numBtn, 14 * f, scientificPanel: true),
+          premiumButton('0', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('.', numBtn, 17 * f, scientificPanel: true),
+          premiumButton('=', equalBtn, 17 * f, scientificPanel: true),
+        ]),
       ];
 
   Widget menuTile({required IconData icon, required String title, required String subtitle, required List<Color> colors, required VoidCallback onTap}) {
@@ -805,7 +1359,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
       child: Container(
         height: 118,
         padding: const EdgeInsets.all(13),
-        decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF071323).withOpacity(0.70) : Colors.white.withOpacity(0.72), borderRadius: BorderRadius.circular(22), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.05))),
+        decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF151517).withOpacity(0.70) : Colors.white.withOpacity(0.72), borderRadius: BorderRadius.circular(22), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.05))),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Container(height: 42, width: 42, decoration: BoxDecoration(gradient: LinearGradient(colors: colors, begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(16), boxShadow: [BoxShadow(color: colors.last.withOpacity(0.28), blurRadius: 12, offset: const Offset(0, 6))]), child: Icon(icon, color: Colors.white, size: 22)),
           const Spacer(),
@@ -912,7 +1466,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
               padding: const EdgeInsets.all(18),
               decoration: BoxDecoration(
                 gradient: LinearGradient(
-                  colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF071323)] : [Colors.white, const Color(0xFFE8F2FB)],
+                  colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF151517)] : [Colors.white, const Color(0xFFE8F2FB)],
                   begin: Alignment.topLeft,
                   end: Alignment.bottomRight,
                 ),
@@ -1030,19 +1584,21 @@ class _CalculatorPageState extends State<CalculatorPage> {
                   builder: (context, scale, child) => Transform.scale(scale: scale, child: child),
                   child: Container(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-                    decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF071323)] : [Colors.white, const Color(0xFFE8F2FB)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(28), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.85)), boxShadow: [BoxShadow(color: const Color(0xFF00D4FF).withOpacity(widget.darkMode ? 0.13 : 0.06), blurRadius: 28, offset: const Offset(0, 10)), BoxShadow(color: Colors.black.withOpacity(widget.darkMode ? 0.40 : 0.12), blurRadius: 30, offset: const Offset(0, 14))]),
+                    decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF151517)] : [Colors.white, const Color(0xFFE8F2FB)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(28), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.85)), boxShadow: [BoxShadow(color: const Color(0xFF00D4FF).withOpacity(widget.darkMode ? 0.13 : 0.06), blurRadius: 28, offset: const Offset(0, 10)), BoxShadow(color: Colors.black.withOpacity(widget.darkMode ? 0.40 : 0.12), blurRadius: 30, offset: const Offset(0, 14))]),
                     child: Column(mainAxisSize: MainAxisSize.min, children: [
                       Container(height: 5, width: 46, decoration: BoxDecoration(color: mutedTextColor.withOpacity(0.45), borderRadius: BorderRadius.circular(20))),
                       const SizedBox(height: 16),
-                      Row(children: [Text('Quick Actions', style: TextStyle(color: mainTextColor, fontSize: 20, fontWeight: FontWeight.w900)), const Spacer(), PressScale(borderRadius: BorderRadius.circular(18), onTap: () => Navigator.pop(context), child: Container(height: 34, width: 34, decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB), shape: BoxShape.circle), child: Icon(Icons.close_rounded, color: mainTextColor, size: 20)))]),
+                      Row(children: [Text('Quick Actions', style: TextStyle(color: mainTextColor, fontSize: 20, fontWeight: FontWeight.w900)), const Spacer(), PressScale(borderRadius: BorderRadius.circular(18), onTap: () => Navigator.pop(context), child: Container(height: 34, width: 34, decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB), shape: BoxShape.circle), child: Icon(Icons.close_rounded, color: mainTextColor, size: 20)))]),
                       const SizedBox(height: 16),
-                      Row(children: [Expanded(child: menuTile(icon: Icons.save_rounded, title: 'Save', subtitle: 'Calculation', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: () { Navigator.pop(context); saveDialog(); })), const SizedBox(width: 10), Expanded(child: menuTile(icon: Icons.history_rounded, title: 'History', subtitle: 'Records', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () { Navigator.pop(context); openHistory(); }))]),
+                      Row(children: [Expanded(child: menuTile(icon: Icons.history_rounded, title: 'History', subtitle: 'Records', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () { Navigator.pop(context); openHistory(); })), const SizedBox(width: 10), Expanded(child: menuTile(icon: Icons.folder_shared_rounded, title: 'Notebook', subtitle: 'Business', colors: const [Color(0xFFFFB143), Color(0xFFFF7C00)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => BusinessNotebookPage(darkMode: widget.darkMode))); }))]),
                       const SizedBox(height: 10),
-                      Row(children: [Expanded(child: menuTile(icon: Icons.swap_horiz_rounded, title: 'Converter', subtitle: 'Units', colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => UnitConverterPage(darkMode: widget.darkMode))); })), const SizedBox(width: 10), Expanded(child: menuTile(icon: Icons.apps_rounded, title: 'Tools', subtitle: 'Smart', colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => ToolsPage(darkMode: widget.darkMode))); }))]),
+                      Row(children: [Expanded(child: menuTile(icon: Icons.swap_horiz_rounded, title: 'Converter', subtitle: 'Units', colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => UnitConverterPage(darkMode: widget.darkMode))); })), const SizedBox(width: 10), Expanded(child: menuTile(icon: Icons.apps_rounded, title: 'Smart Tools', subtitle: 'All tools', colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => ToolsPage(darkMode: widget.darkMode))); }))]),
                       const SizedBox(height: 10),
-                      PressScale(borderRadius: BorderRadius.circular(22), pressedScale: 0.98, onTap: () { Navigator.pop(context); openCloudBackupSheet(); }, child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14), decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF071323).withOpacity(0.70) : Colors.white.withOpacity(0.70), borderRadius: BorderRadius.circular(22), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.06))), child: Row(children: [Container(height: 44, width: 44, decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF22D3EE), Color(0xFF7C4DFF)]), borderRadius: BorderRadius.circular(17)), child: Icon(firebaseUser == null ? Icons.login_rounded : Icons.cloud_done_rounded, color: Colors.white)), const SizedBox(width: 12), Expanded(child: Text(firebaseUser == null ? 'Sign in with Google' : 'Auto Backup & Restore', style: TextStyle(color: mainTextColor, fontSize: 16, fontWeight: FontWeight.w900))), Icon(Icons.arrow_forward_ios_rounded, color: mutedTextColor, size: 16)]))),
+                      Row(children: [Expanded(child: menuTile(icon: Icons.lock_rounded, title: 'App Lock', subtitle: 'PIN', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => PinLockSettingsPage(darkMode: widget.darkMode))); })), const SizedBox(width: 10), Expanded(child: menuTile(icon: Icons.person_rounded, title: 'About', subtitle: 'Developer', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () { Navigator.pop(context); Navigator.push(context, MaterialPageRoute(builder: (_) => AboutDeveloperPage(darkMode: widget.darkMode))); }))]),
                       const SizedBox(height: 10),
-                      PressScale(borderRadius: BorderRadius.circular(22), pressedScale: 0.98, onTap: () { Navigator.pop(context); widget.onThemeChanged(!widget.darkMode); }, child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14), decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF071323).withOpacity(0.70) : Colors.white.withOpacity(0.70), borderRadius: BorderRadius.circular(22), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.06))), child: Row(children: [Container(height: 44, width: 44, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFFFFD86B), const Color(0xFFFF8A00)] : [const Color(0xFF293BFF), const Color(0xFF071323)]), borderRadius: BorderRadius.circular(17)), child: Icon(widget.darkMode ? Icons.light_mode_rounded : Icons.dark_mode_rounded, color: Colors.white)), const SizedBox(width: 12), Expanded(child: Text(widget.darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode', style: TextStyle(color: mainTextColor, fontSize: 16, fontWeight: FontWeight.w900))), Icon(Icons.arrow_forward_ios_rounded, color: mutedTextColor, size: 16)]))),
+                      PressScale(borderRadius: BorderRadius.circular(22), pressedScale: 0.98, onTap: () { Navigator.pop(context); openCloudBackupSheet(); }, child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14), decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF151517).withOpacity(0.70) : Colors.white.withOpacity(0.70), borderRadius: BorderRadius.circular(22), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.06))), child: Row(children: [Container(height: 44, width: 44, decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF22D3EE), Color(0xFF7C4DFF)]), borderRadius: BorderRadius.circular(17)), child: Icon(firebaseUser == null ? Icons.login_rounded : Icons.cloud_done_rounded, color: Colors.white)), const SizedBox(width: 12), Expanded(child: Text(firebaseUser == null ? 'Sign in with Google' : 'Auto Backup & Restore', style: TextStyle(color: mainTextColor, fontSize: 16, fontWeight: FontWeight.w900))), Icon(Icons.arrow_forward_ios_rounded, color: mutedTextColor, size: 16)]))),
+                      const SizedBox(height: 10),
+                      PressScale(borderRadius: BorderRadius.circular(22), pressedScale: 0.98, onTap: () { Navigator.pop(context); widget.onThemeChanged(!widget.darkMode); }, child: Container(width: double.infinity, padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14), decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF151517).withOpacity(0.70) : Colors.white.withOpacity(0.70), borderRadius: BorderRadius.circular(22), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.06))), child: Row(children: [Container(height: 44, width: 44, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFFFFD86B), const Color(0xFFFF8A00)] : [const Color(0xFF293BFF), const Color(0xFF151517)]), borderRadius: BorderRadius.circular(17)), child: Icon(widget.darkMode ? Icons.light_mode_rounded : Icons.dark_mode_rounded, color: Colors.white)), const SizedBox(width: 12), Expanded(child: Text(widget.darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode', style: TextStyle(color: mainTextColor, fontSize: 16, fontWeight: FontWeight.w900))), Icon(Icons.arrow_forward_ios_rounded, color: mutedTextColor, size: 16)]))),
                     ]),
                   ),
                 ),
@@ -1060,9 +1616,9 @@ class _CalculatorPageState extends State<CalculatorPage> {
       child: Row(children: [
         PressScale(borderRadius: BorderRadius.circular(20), onTap: toggleScientificMode, child: AnimatedContainer(duration: const Duration(milliseconds: 220), height: 34, width: 34, decoration: BoxDecoration(color: scientificMode ? equalBtn : card2, shape: BoxShape.circle, border: Border.all(color: Colors.white12)), child: Icon(scientificMode ? Icons.calculate_rounded : Icons.science_rounded, size: 18))),
         Expanded(child: Center(child: AnimatedSwitcher(duration: const Duration(milliseconds: 220), child: Text(scientificMode ? 'Calc+ Scientific' : 'Calc+', key: ValueKey(scientificMode), style: TextStyle(fontSize: 19 * fontScale, fontWeight: FontWeight.w900, color: mainTextColor))))),
-        TextButton(onPressed: toggleWordLanguage, child: Text(banglaWord ? 'English' : 'বাংলা', style: TextStyle(color: Colors.cyanAccent, fontSize: 12 * fontScale, fontWeight: FontWeight.bold))),
+        TextButton(onPressed: toggleWordLanguage, child: Text(banglaWord ? 'English' : 'বাংলা', style: TextStyle(color: opBtn, fontSize: 12 * fontScale, fontWeight: FontWeight.bold))),
         PressScale(borderRadius: BorderRadius.circular(16), onTap: openCloudBackupSheet, child: Container(height: 34, width: 34, margin: const EdgeInsets.only(right: 6), decoration: BoxDecoration(color: firebaseUser == null ? card2 : const Color(0xFF0F9D58).withOpacity(0.28), shape: BoxShape.circle, border: Border.all(color: firebaseUser == null ? Colors.white12 : Colors.greenAccent.withOpacity(0.35))), child: Icon(firebaseUser == null ? Icons.person_outline_rounded : Icons.cloud_done_rounded, size: 18, color: firebaseUser == null ? mainTextColor : Colors.greenAccent))),
-        PressScale(borderRadius: BorderRadius.circular(18), onTap: openPremiumMenu, child: Container(height: 38, width: 38, decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF9A6BFF), Color(0xFF22D3EE)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withOpacity(0.18)), boxShadow: [BoxShadow(color: const Color(0xFF00D4FF).withOpacity(0.22), blurRadius: 14, offset: const Offset(0, 6))]), child: const Icon(Icons.auto_awesome_rounded, color: Colors.white, size: 21))),
+        PressScale(borderRadius: BorderRadius.circular(18), onTap: openPremiumMenu, child: Container(height: 38, width: 38, decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFF3A3A3C), Color(0xFF1C1C1E)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withOpacity(0.08)), boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.24), blurRadius: 10, offset: const Offset(0, 5))]), child: const Icon(Icons.auto_awesome_rounded, color: Color(0xFFFF9F0A), size: 21))),
       ]),
     );
   }
@@ -1074,15 +1630,68 @@ class _CalculatorPageState extends State<CalculatorPage> {
       height: h * 0.145,
       margin: const EdgeInsets.symmetric(horizontal: 10),
       padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
-      decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)] : [Colors.white, const Color(0xFFE8F2FB)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.80)), boxShadow: [BoxShadow(color: const Color(0xFF00D4FF).withOpacity(widget.darkMode ? 0.12 : 0.06), blurRadius: 26, offset: const Offset(0, 8)), BoxShadow(color: Colors.black.withOpacity(widget.darkMode ? 0.35 : 0.10), blurRadius: 22, offset: const Offset(0, 12))]),
+      decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8E8ED)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.07) : Colors.black.withOpacity(0.04)), boxShadow: [BoxShadow(color: Colors.black.withOpacity(widget.darkMode ? 0.32 : 0.08), blurRadius: 18, offset: const Offset(0, 9))]),
       child: Column(children: [
         Expanded(child: Align(alignment: Alignment.centerRight, child: SingleChildScrollView(scrollDirection: Axis.horizontal, reverse: true, child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), child: Text(expression.isEmpty ? '0' : expression, key: ValueKey(expression), style: TextStyle(color: mutedTextColor, fontSize: 15 * fontScale)))))),
-        Expanded(child: Row(children: [PressScale(borderRadius: BorderRadius.circular(16), onTap: copyResult, child: Container(width: 34, height: 34, decoration: BoxDecoration(color: Colors.black.withOpacity(0.18), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.cyanAccent.withOpacity(0.25))), child: const Icon(Icons.copy_rounded, size: 18, color: Colors.cyanAccent))), const SizedBox(width: 6), PressScale(borderRadius: BorderRadius.circular(16), onTap: shareCalculatorResult, child: Container(width: 34, height: 34, decoration: BoxDecoration(color: Colors.black.withOpacity(0.18), borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.cyanAccent.withOpacity(0.25))), child: const Icon(Icons.share_rounded, size: 18, color: Colors.cyanAccent))), const SizedBox(width: 8), Expanded(child: Align(alignment: Alignment.centerRight, child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), transitionBuilder: (child, animation) => ScaleTransition(scale: animation, child: FadeTransition(opacity: animation, child: child)), child: FittedBox(key: ValueKey(result), fit: BoxFit.scaleDown, child: Text(result, style: TextStyle(fontSize: 38 * fontScale, fontWeight: FontWeight.w900, color: mainTextColor))))))])),
+        Expanded(child: Align(alignment: Alignment.centerRight, child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), transitionBuilder: (child, animation) => ScaleTransition(scale: animation, child: FadeTransition(opacity: animation, child: child)), child: FittedBox(key: ValueKey(result), fit: BoxFit.scaleDown, child: Text(result, style: TextStyle(fontSize: 40 * fontScale, fontWeight: FontWeight.w900, color: mainTextColor)))))),
       ]),
     );
   }
 
-  Widget wordBox(double h, double fontScale) => AnimatedContainer(duration: const Duration(milliseconds: 220), width: double.infinity, height: scientificMode ? h * 0.065 : h * 0.075, margin: const EdgeInsets.fromLTRB(10, 8, 10, 8), padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10), decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(22), border: Border.all(color: Colors.white.withOpacity(0.08))), alignment: Alignment.centerLeft, child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), child: Text(wordText, key: ValueKey(wordText), maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(color: Colors.cyanAccent, fontSize: 13 * fontScale))));
+  Widget wordBox(double h, double fontScale) => AnimatedContainer(duration: const Duration(milliseconds: 220), width: double.infinity, height: scientificMode ? h * 0.065 : h * 0.075, margin: const EdgeInsets.fromLTRB(10, 8, 10, 8), padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10), decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(22), border: Border.all(color: Colors.white.withOpacity(0.06))), alignment: Alignment.centerLeft, child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), child: Text(wordText, key: ValueKey(wordText), maxLines: 2, overflow: TextOverflow.ellipsis, style: TextStyle(color: opBtn, fontSize: 13 * fontScale, fontWeight: FontWeight.w600))));
+
+  Widget smartActionDock(double fontScale) {
+    Widget dockItem({
+      required IconData icon,
+      required String label,
+      required List<Color> colors,
+      required VoidCallback onTap,
+    }) {
+      return Padding(
+        padding: const EdgeInsets.only(right: 8),
+        child: PressScale(
+          borderRadius: BorderRadius.circular(18),
+          pressedScale: 0.96,
+          onTap: onTap,
+          child: Container(
+            height: scientificMode ? 34 : 40,
+            padding: EdgeInsets.symmetric(horizontal: scientificMode ? 10 : 12),
+            decoration: BoxDecoration(
+              color: widget.darkMode ? const Color(0xFF151517) : Colors.white,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.08) : Colors.black.withOpacity(0.05)),
+              boxShadow: [BoxShadow(color: colors.last.withOpacity(widget.darkMode ? 0.16 : 0.09), blurRadius: 12, offset: const Offset(0, 5))],
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Container(
+                height: scientificMode ? 24 : 27,
+                width: scientificMode ? 24 : 27,
+                decoration: BoxDecoration(gradient: LinearGradient(colors: colors), borderRadius: BorderRadius.circular(11)),
+                child: Icon(icon, color: Colors.white, size: scientificMode ? 14 : 15),
+              ),
+              SizedBox(width: scientificMode ? 5 : 7),
+              Text(label, style: TextStyle(color: mainTextColor, fontSize: (scientificMode ? 10.5 : 12) * fontScale, fontWeight: FontWeight.w900)),
+            ]),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      height: scientificMode ? 38 : 46,
+      margin: EdgeInsets.fromLTRB(10, 0, 10, scientificMode ? 4 : 8),
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        physics: const BouncingScrollPhysics(),
+        child: Row(children: [
+          dockItem(icon: Icons.copy_rounded, label: 'Copy', colors: const [Color(0xFFFFB143), Color(0xFFFF9500)], onTap: copyResult),
+          dockItem(icon: Icons.share_rounded, label: 'Share', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: shareCalculatorResult),
+          dockItem(icon: Icons.picture_as_pdf_rounded, label: 'PDF', colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)], onTap: exportCalculatorPdfDirect),
+          dockItem(icon: Icons.save_rounded, label: 'Save', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: saveDialog),
+        ]),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1098,12 +1707,13 @@ class _CalculatorPageState extends State<CalculatorPage> {
             child: Container(
               width: calculatorWidth,
               height: h,
-              decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF06101F), const Color(0xFF020611)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)),
+              decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF000000), const Color(0xFF070707)] : [const Color(0xFFF7F7F8), const Color(0xFFEDEDF2)], begin: Alignment.topCenter, end: Alignment.bottomCenter)),
               child: Column(children: [
                 topBar(fontScale),
                 SizedBox(height: 22, child: Center(child: AnimatedSwitcher(duration: const Duration(milliseconds: 180), child: Text(miniHistory.isEmpty ? '' : miniHistory.first, key: ValueKey(miniHistory.isEmpty ? '' : miniHistory.first), maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: widget.darkMode ? Colors.white38 : Colors.black38, fontSize: 11 * fontScale))))),
                 displayBox(h, fontScale),
                 wordBox(h, fontScale),
+                smartActionDock(fontScale),
                 Expanded(child: Padding(padding: const EdgeInsets.fromLTRB(6, 0, 6, 8), child: AnimatedSwitcher(duration: const Duration(milliseconds: 240), child: Column(key: ValueKey(scientificMode), children: scientificMode ? scientificButtons(fontScale) : normalButtons(fontScale))))),
               ]),
             ),
@@ -1146,14 +1756,197 @@ class _HistoryPageState extends State<HistoryPage> {
   Map<String, List<int>> groupAuto(List<int> indexes) { final map = <String, List<int>>{}; for (final i in indexes) { final key = formatDate(widget.autoHistory[i].dateTime); map.putIfAbsent(key, () => []); map[key]!.add(i); } return map; }
   Map<String, List<int>> groupSaved(List<int> indexes) { final map = <String, List<int>>{}; for (final i in indexes) { final key = formatDate(widget.savedItems[i].dateTime); map.putIfAbsent(key, () => []); map[key]!.add(i); } return map; }
 
+  List<int> currentAutoExportIndexes() {
+    if (tab == 0) return autoIndexes();
+    if (tab == 2) return autoIndexes(favoriteOnly: true);
+    if (tab == 3) return autoIndexes(deleted: true);
+    return <int>[];
+  }
+
+  List<int> currentSavedExportIndexes() {
+    if (tab == 1) return savedIndexes();
+    if (tab == 2) return savedIndexes(favoriteOnly: true);
+    if (tab == 3) return savedIndexes(deleted: true);
+    return <int>[];
+  }
+
+  String cleanPersonName(String value) {
+    final name = value.trim();
+    if (name.isEmpty || name.toLowerCase() == 'no name') return 'No Name';
+    return name;
+  }
+
+  List<String> savedPersonNamesForExport(List<int> indexes) {
+    final set = <String>{};
+    for (final i in indexes) {
+      set.add(cleanPersonName(widget.savedItems[i].personName));
+    }
+    final list = set.toList();
+    list.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return list;
+  }
+
+  String savedReportText(List<SavedCalculation> list, String title) {
+    final buffer = StringBuffer()
+      ..writeln(title)
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('Total Records: ${list.length}')
+      ..writeln('');
+
+    for (int i = 0; i < list.length; i++) {
+      final item = list[i];
+      buffer
+        ..writeln('${i + 1}. ${item.title}')
+        ..writeln('Person: ${cleanPersonName(item.personName)}')
+        ..writeln('Calculation: ${item.expression} = ${item.result}')
+        ..writeln('Note: ${item.note.trim().isEmpty ? '-' : item.note.trim()}')
+        ..writeln('Date: ${formatDate(item.dateTime)}, ${formatTime(item.dateTime)}')
+        ..writeln('------------------------------');
+    }
+    return buffer.toString();
+  }
+
+  String autoReportText(List<AutoHistoryItem> list, String title) {
+    final buffer = StringBuffer()
+      ..writeln(title)
+      ..writeln('Generated: ${DateTime.now()}')
+      ..writeln('Total Records: ${list.length}')
+      ..writeln('');
+
+    for (int i = 0; i < list.length; i++) {
+      final item = list[i];
+      buffer
+        ..writeln('${i + 1}. ${item.expression} = ${item.result}')
+        ..writeln('Date: ${formatDate(item.dateTime)}, ${formatTime(item.dateTime)}')
+        ..writeln('------------------------------');
+    }
+    return buffer.toString();
+  }
+
+  Future<void> exportSavedPdf(List<SavedCalculation> list, String title, {String? fileName}) async {
+    if (list.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Export করার মতো saved record নেই')));
+      return;
+    }
+    await exportTextPdf(context, title: title, text: savedReportText(list, title), fileName: fileName ?? safePdfFileName(title));
+  }
+
+  Future<void> exportAutoPdf(List<AutoHistoryItem> list, String title, {String? fileName}) async {
+    if (list.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Export করার মতো auto history নেই')));
+      return;
+    }
+    await exportTextPdf(context, title: title, text: autoReportText(list, title), fileName: fileName ?? safePdfFileName(title));
+  }
+
+  void showHistoryExportOptions() {
+    final autoIdx = currentAutoExportIndexes();
+    final savedIdx = currentSavedExportIndexes();
+    final autoList = autoIdx.map((i) => widget.autoHistory[i]).toList();
+    final savedList = savedIdx.map((i) => widget.savedItems[i]).toList();
+
+    if (autoList.isEmpty && savedList.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Export করার মতো record নেই')));
+      return;
+    }
+
+    final people = savedPersonNamesForExport(savedIdx);
+    final title = tab == 0 ? 'Auto History Report' : tab == 1 ? 'Saved Calculations Report' : tab == 2 ? 'Favorite Calculations Report' : 'Deleted Calculations Report';
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF111214),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+      builder: (_) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(child: Container(width: 46, height: 5, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(99)))),
+              const SizedBox(height: 16),
+              const Text('Download PDF', style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w900)),
+              const SizedBox(height: 8),
+              const Text('এই page-এর records PDF করো। Saved tab-এ Person অনুযায়ী আলাদা PDF পাওয়া যাবে।', style: TextStyle(color: Colors.white60, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 14),
+              if (autoList.isNotEmpty)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.history_rounded, color: Colors.cyanAccent),
+                  title: Text(tab == 0 ? 'All Auto History PDF' : '$title - Auto PDF', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900)),
+                  subtitle: Text('${autoList.length} records', style: const TextStyle(color: Colors.white60)),
+                  trailing: const Icon(Icons.download_rounded, color: Colors.orangeAccent),
+                  onTap: () {
+                    Navigator.pop(context);
+                    exportAutoPdf(autoList, tab == 0 ? 'Auto History Report' : '$title - Auto', fileName: tab == 0 ? 'masum_auto_history.pdf' : null);
+                  },
+                ),
+              if (savedList.isNotEmpty)
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.picture_as_pdf_rounded, color: Colors.orangeAccent),
+                  title: Text(tab == 1 ? 'All Saved Calculations PDF' : '$title - Saved PDF', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900)),
+                  subtitle: Text('${savedList.length} records', style: const TextStyle(color: Colors.white60)),
+                  trailing: const Icon(Icons.download_rounded, color: Colors.orangeAccent),
+                  onTap: () {
+                    Navigator.pop(context);
+                    exportSavedPdf(savedList, tab == 1 ? 'Saved Calculations Report' : '$title - Saved', fileName: tab == 1 ? 'masum_saved_calculations.pdf' : null);
+                  },
+                ),
+              if (people.isNotEmpty) ...[
+                const Divider(color: Colors.white12),
+                Flexible(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: people.length,
+                    itemBuilder: (context, i) {
+                      final person = people[i];
+                      final personItems = savedList.where((item) => cleanPersonName(item.personName).toLowerCase() == person.toLowerCase()).toList();
+                      return ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: const Icon(Icons.person_rounded, color: Colors.cyanAccent),
+                        title: Text('$person PDF', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w900)),
+                        subtitle: Text('${personItems.length} saved records', style: const TextStyle(color: Colors.white60)),
+                        trailing: const Icon(Icons.download_rounded, color: Colors.orangeAccent),
+                        onTap: () {
+                          Navigator.pop(context);
+                          exportSavedPdf(
+                            personItems,
+                            '$person Saved Calculations Report',
+                            fileName: safePdfFileName('${person}_saved_calculations'),
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     const bg = Color(0xFF050B16);
     return Scaffold(
       backgroundColor: bg,
-      appBar: AppBar(backgroundColor: bg, title: Text(tab == 0 ? 'Auto History' : tab == 1 ? 'Saved Calculations' : tab == 2 ? 'Favorites' : 'Deleted History')),
+      appBar: AppBar(
+        backgroundColor: bg,
+        title: Text(tab == 0 ? 'Auto History' : tab == 1 ? 'Saved Calculations' : tab == 2 ? 'Favorites' : 'Deleted History'),
+        actions: [
+          IconButton(
+            tooltip: 'Download PDF',
+            icon: const Icon(Icons.download_rounded, color: Colors.cyanAccent),
+            onPressed: showHistoryExportOptions,
+          ),
+        ],
+      ),
       body: Column(children: [
-        Padding(padding: const EdgeInsets.fromLTRB(12, 6, 12, 4), child: TextField(onChanged: (v) => setState(() => search = v), decoration: InputDecoration(hintText: 'Search name, title, note, date, amount...', prefixIcon: const Icon(Icons.search), filled: true, fillColor: const Color(0xFF0E1B2C), border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none)))),
+        Padding(padding: const EdgeInsets.fromLTRB(12, 6, 12, 4), child: TextField(onChanged: (v) => setState(() => search = v), decoration: InputDecoration(hintText: 'Search name, title, note, date, amount...', prefixIcon: const Icon(Icons.search), filled: true, fillColor: const Color(0xFF111214), border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none)))),
         Row(children: [tabButton('Auto', 0), tabButton('Saved', 1), tabButton('⭐', 2), tabButton('Deleted', 3)]),
         Expanded(child: tab == 0 ? buildAutoList(autoIndexes()) : tab == 1 ? buildSavedList(savedIndexes()) : tab == 2 ? buildFavoriteList() : buildDeletedList()),
       ]),
@@ -1169,50 +1962,50 @@ class _HistoryPageState extends State<HistoryPage> {
 
   Widget autoCard(int i, {required bool deletedView}) {
     final item = widget.autoHistory[i];
-    return Card(color: const Color(0xFF0E1B2C), margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)), child: ListTile(title: Text('${item.expression} = ${item.result}', style: const TextStyle(fontWeight: FontWeight.bold)), subtitle: Text('${formatDate(item.dateTime)}, ${formatTime(item.dateTime)}'), trailing: Wrap(children: deletedView ? [IconButton(icon: const Icon(Icons.restore, color: Colors.greenAccent), onPressed: () => setState(() => widget.onRecoverAuto(i))), IconButton(icon: const Icon(Icons.delete_forever, color: Colors.redAccent), onPressed: () => setState(() => widget.onPermanentDeleteAuto(i)))] : [IconButton(icon: Icon(item.isFavorite ? Icons.star : Icons.star_border, color: item.isFavorite ? Colors.amber : Colors.white54), onPressed: () => setState(() => widget.onFavoriteAuto(i))), IconButton(icon: const Icon(Icons.open_in_new, color: Colors.cyanAccent), onPressed: () { widget.onLoadAuto(item); Navigator.pop(context); }), IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () => setState(() => widget.onSoftDeleteAuto(i)))])));
+    return Card(color: const Color(0xFF111214), margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)), child: ListTile(title: Text('${item.expression} = ${item.result}', style: const TextStyle(fontWeight: FontWeight.bold)), subtitle: Text('${formatDate(item.dateTime)}, ${formatTime(item.dateTime)}'), trailing: Wrap(children: deletedView ? [IconButton(icon: const Icon(Icons.restore, color: Colors.greenAccent), onPressed: () => setState(() => widget.onRecoverAuto(i))), IconButton(icon: const Icon(Icons.delete_forever, color: Colors.redAccent), onPressed: () => setState(() => widget.onPermanentDeleteAuto(i)))] : [IconButton(icon: Icon(item.isFavorite ? Icons.star : Icons.star_border, color: item.isFavorite ? Colors.amber : Colors.white54), onPressed: () => setState(() => widget.onFavoriteAuto(i))), IconButton(icon: const Icon(Icons.open_in_new, color: Colors.cyanAccent), onPressed: () { widget.onLoadAuto(item); Navigator.pop(context); }), IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () => setState(() => widget.onSoftDeleteAuto(i)))])));
   }
 
   Widget savedCard(int i, {required bool deletedView}) {
     final item = widget.savedItems[i];
-    return Card(color: const Color(0xFF0E1B2C), margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)), child: ListTile(title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.bold)), subtitle: Text('Person: ${item.personName}\n${item.expression} = ${item.result}\nNote: ${item.note}\nDate: ${formatDate(item.dateTime)}, ${formatTime(item.dateTime)}'), trailing: Wrap(children: deletedView ? [IconButton(icon: const Icon(Icons.restore, color: Colors.greenAccent), onPressed: () => setState(() => widget.onRecoverSaved(i))), IconButton(icon: const Icon(Icons.delete_forever, color: Colors.redAccent), onPressed: () => setState(() => widget.onPermanentDeleteSaved(i)))] : [IconButton(icon: Icon(item.isFavorite ? Icons.star : Icons.star_border, color: item.isFavorite ? Colors.amber : Colors.white54), onPressed: () => setState(() => widget.onFavoriteSaved(i))), IconButton(icon: const Icon(Icons.open_in_new, color: Colors.cyanAccent), onPressed: () { widget.onLoadSaved(item); Navigator.pop(context); }), IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () => setState(() => widget.onSoftDeleteSaved(i)))])));
+    return Card(color: const Color(0xFF111214), margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)), child: ListTile(title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.bold)), subtitle: Text('Person: ${item.personName}\n${item.expression} = ${item.result}\nNote: ${item.note}\nDate: ${formatDate(item.dateTime)}, ${formatTime(item.dateTime)}'), trailing: Wrap(children: deletedView ? [IconButton(icon: const Icon(Icons.restore, color: Colors.greenAccent), onPressed: () => setState(() => widget.onRecoverSaved(i))), IconButton(icon: const Icon(Icons.delete_forever, color: Colors.redAccent), onPressed: () => setState(() => widget.onPermanentDeleteSaved(i)))] : [IconButton(icon: Icon(item.isFavorite ? Icons.star : Icons.star_border, color: item.isFavorite ? Colors.amber : Colors.white54), onPressed: () => setState(() => widget.onFavoriteSaved(i))), IconButton(icon: const Icon(Icons.open_in_new, color: Colors.cyanAccent), onPressed: () { widget.onLoadSaved(item); Navigator.pop(context); }), IconButton(icon: const Icon(Icons.delete, color: Colors.redAccent), onPressed: () => setState(() => widget.onSoftDeleteSaved(i)))])));
   }
 }
 
 class ToolsPage extends StatelessWidget {
   final bool darkMode;
   const ToolsPage({super.key, required this.darkMode});
-  Color get bg => darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get mainText => darkMode ? Colors.white : const Color(0xFF071323);
+  Color get bg => darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get mainText => darkMode ? Colors.white : const Color(0xFF151517);
   Color get mutedText => darkMode ? Colors.white60 : const Color(0xFF526070);
 
   Widget toolCard({required BuildContext context, required IconData icon, required String title, required String subtitle, required List<Color> colors, required VoidCallback onTap}) {
-    return Padding(padding: const EdgeInsets.only(bottom: 14), child: PressScale(borderRadius: BorderRadius.circular(26), pressedScale: 0.98, onTap: onTap, child: Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: darkMode ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)] : [Colors.white, const Color(0xFFE8F2FB)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(26), border: Border.all(color: darkMode ? Colors.white.withOpacity(0.10) : Colors.white.withOpacity(0.80)), boxShadow: [BoxShadow(color: colors.last.withOpacity(darkMode ? 0.18 : 0.10), blurRadius: 18, offset: const Offset(0, 8)), BoxShadow(color: Colors.black.withOpacity(darkMode ? 0.28 : 0.08), blurRadius: 18, offset: const Offset(0, 10))]), child: Row(children: [Container(height: 58, width: 58, decoration: BoxDecoration(gradient: LinearGradient(colors: colors, begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(22), boxShadow: [BoxShadow(color: colors.last.withOpacity(0.32), blurRadius: 14, offset: const Offset(0, 7))]), child: Icon(icon, color: Colors.white, size: 28)), const SizedBox(width: 15), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: TextStyle(color: mainText, fontSize: 19, fontWeight: FontWeight.w900)), const SizedBox(height: 5), Text(subtitle, style: TextStyle(color: mutedText, fontSize: 13, fontWeight: FontWeight.w600))])), Icon(Icons.arrow_forward_ios_rounded, color: mutedText, size: 18)]))));
+    return Padding(padding: const EdgeInsets.only(bottom: 14), child: PressScale(borderRadius: BorderRadius.circular(26), pressedScale: 0.98, onTap: onTap, child: Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8F2FB)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(26), border: Border.all(color: darkMode ? Colors.white.withOpacity(0.10) : Colors.white.withOpacity(0.80)), boxShadow: [BoxShadow(color: colors.last.withOpacity(darkMode ? 0.18 : 0.10), blurRadius: 18, offset: const Offset(0, 8)), BoxShadow(color: Colors.black.withOpacity(darkMode ? 0.28 : 0.08), blurRadius: 18, offset: const Offset(0, 10))]), child: Row(children: [Container(height: 58, width: 58, decoration: BoxDecoration(gradient: LinearGradient(colors: colors, begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(22), boxShadow: [BoxShadow(color: colors.last.withOpacity(0.32), blurRadius: 14, offset: const Offset(0, 7))]), child: Icon(icon, color: Colors.white, size: 28)), const SizedBox(width: 15), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: TextStyle(color: mainText, fontSize: 19, fontWeight: FontWeight.w900)), const SizedBox(height: 5), Text(subtitle, style: TextStyle(color: mutedText, fontSize: 13, fontWeight: FontWeight.w600))])), Icon(Icons.arrow_forward_ios_rounded, color: mutedText, size: 18)]))));
   }
 
   @override
   Widget build(BuildContext context) {
     final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity;
-    return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Smart Tools', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText)), body: Center(child: Container(width: maxWidth, height: double.infinity, decoration: BoxDecoration(gradient: LinearGradient(colors: darkMode ? [const Color(0xFF06101F), const Color(0xFF020611)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 12, 14, 18), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Useful daily calculators', style: TextStyle(color: mutedText, fontSize: 14, fontWeight: FontWeight.w700)), const SizedBox(height: 14), toolCard(context: context, icon: Icons.history_rounded, title: 'Smart History', subtitle: 'Age, BMI and discount records', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SmartToolHistoryPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.cake_rounded, title: 'Age Calculator', subtitle: 'Calculate age from date of birth', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AgeCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.monitor_weight_rounded, title: 'BMI Calculator', subtitle: 'Check body mass index with status', colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BMICalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.local_offer_rounded, title: 'Discount Calculator', subtitle: 'Find discount price and savings', colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DiscountCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.trending_up_rounded, title: 'Profit / Loss Calculator', subtitle: 'Calculate profit, loss and percentage', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ProfitLossCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.account_balance_rounded, title: 'EMI / Loan Calculator', subtitle: 'Monthly EMI, total interest and payment', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => EMILoanCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.person_rounded, title: 'About Developer', subtitle: 'Contact, WhatsApp, Email and Feedback', colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AboutDeveloperPage(darkMode: darkMode))))])))));
+    return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Smart Tools', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText)), body: Center(child: Container(width: maxWidth, height: double.infinity, decoration: BoxDecoration(gradient: LinearGradient(colors: darkMode ? [const Color(0xFF050505), const Color(0xFF000000)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 12, 14, 18), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Useful daily calculators', style: TextStyle(color: mutedText, fontSize: 14, fontWeight: FontWeight.w700)), const SizedBox(height: 14), toolCard(context: context, icon: Icons.history_rounded, title: 'Smart History', subtitle: 'Age, BMI and discount records', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => SmartToolHistoryPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.cake_rounded, title: 'Age Calculator', subtitle: 'Calculate age from date of birth', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AgeCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.monitor_weight_rounded, title: 'BMI Calculator', subtitle: 'Check body mass index with status', colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => BMICalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.local_offer_rounded, title: 'Discount Calculator', subtitle: 'Find discount price and savings', colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DiscountCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.trending_up_rounded, title: 'Profit / Loss Calculator', subtitle: 'Calculate profit, loss and percentage', colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ProfitLossCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.account_balance_rounded, title: 'EMI / Loan Calculator', subtitle: 'Monthly EMI, total interest and payment', colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => EMILoanCalculatorPage(darkMode: darkMode)))), toolCard(context: context, icon: Icons.person_rounded, title: 'About Developer', subtitle: 'Contact, WhatsApp, Email and Feedback', colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)], onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AboutDeveloperPage(darkMode: darkMode))))])))));
   }
 }
 
 abstract class ToolPageBase<T extends StatefulWidget> extends State<T> {
-  Color pageBg(bool darkMode) => darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
+  Color pageBg(bool darkMode) => darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
   String money(double value) { if (value.isNaN || value.isInfinite) return '0'; if (value % 1 == 0) return value.toInt().toString(); return value.toStringAsFixed(2).replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), ''); }
 }
 
 class AgeCalculatorPage extends StatefulWidget { final bool darkMode; const AgeCalculatorPage({super.key, required this.darkMode}); @override State<AgeCalculatorPage> createState() => _AgeCalculatorPageState(); }
 class _AgeCalculatorPageState extends ToolPageBase<AgeCalculatorPage> {
   DateTime? birthDate; final nameController = TextEditingController(); String ageResult = 'Select your date of birth'; String nextBirthday = ''; String lastSig = '';
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB); Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323); Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB); Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517); Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
   @override void dispose() { nameController.dispose(); super.dispose(); }
   String formatDate(DateTime d) => '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
   void saveRecord() { if (birthDate == null) return; final name = nameController.text.trim().isEmpty ? 'No Name' : nameController.text.trim(); final sig = 'Age|$name|${birthDate!.toIso8601String()}|$ageResult|$nextBirthday'; if (sig == lastSig) return; lastSig = sig; saveSmartToolHistory(SmartToolHistoryItem(type: 'Age', title: '$name Age', details: '$ageResult | $nextBirthday | DOB: ${formatDate(birthDate!)}', dateTime: DateTime.now())); }
   Future<void> pickBirthDate() async { final now = DateTime.now(); final picked = await showDatePicker(context: context, initialDate: birthDate ?? DateTime(now.year - 18, now.month, now.day), firstDate: DateTime(1900), lastDate: now); if (picked == null) return; setState(() { birthDate = picked; calculateAge(); }); saveRecord(); }
   void calculateAge() { if (birthDate == null) return; final today = DateTime.now(); int y = today.year - birthDate!.year, m = today.month - birthDate!.month, d = today.day - birthDate!.day; if (d < 0) { d += DateTime(today.year, today.month, 0).day; m--; } if (m < 0) { m += 12; y--; } ageResult = '$y Years, $m Months, $d Days'; DateTime next = DateTime(today.year, birthDate!.month, birthDate!.day); if (!next.isAfter(DateTime(today.year, today.month, today.day))) next = DateTime(today.year + 1, birthDate!.month, birthDate!.day); nextBirthday = 'Next birthday in ${next.difference(DateTime(today.year, today.month, today.day)).inDays} days'; }
-  Widget glass(Widget child) => Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)] : [Colors.white, const Color(0xFFE8F2FB)]), borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.80))), child: child);
+  Widget glass(Widget child) => Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8F2FB)]), borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.80))), child: child);
   Widget resultBox(String title, String value, IconData icon, List<Color> colors) => glass(Row(children: [Container(height: 56, width: 56, decoration: BoxDecoration(gradient: LinearGradient(colors: colors), borderRadius: BorderRadius.circular(22)), child: Icon(icon, color: Colors.white, size: 28)), const SizedBox(width: 14), Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(title, style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 5), Text(value, style: TextStyle(color: mainText, fontSize: 21, fontWeight: FontWeight.w900))]))]));
-  @override Widget build(BuildContext context) { final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity; return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Age Calculator', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText)), body: Center(child: Container(width: maxWidth, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF06101F), const Color(0xFF020611)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.all(14), child: Column(children: [glass(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Person Name', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 12), TextField(controller: nameController, onChanged: (_) => saveRecord(), decoration: InputDecoration(hintText: 'Enter name, e.g. Masum', filled: true, fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: const Icon(Icons.person_rounded, color: Colors.cyanAccent)))])), const SizedBox(height: 14), glass(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Date of Birth', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 12), PressScale(borderRadius: BorderRadius.circular(20), onTap: pickBirthDate, child: Container(width: double.infinity, padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB), borderRadius: BorderRadius.circular(20)), child: Row(children: [const Icon(Icons.calendar_month_rounded, color: Colors.cyanAccent), const SizedBox(width: 12), Expanded(child: Text(birthDate == null ? 'Tap to select date' : formatDate(birthDate!), style: TextStyle(color: birthDate == null ? mutedText : mainText, fontSize: 18, fontWeight: FontWeight.w800))), const Icon(Icons.arrow_forward_ios_rounded, size: 16, color: Colors.cyanAccent)])))])), const SizedBox(height: 14), resultBox('Your Age', ageResult, Icons.cake_rounded, const [Color(0xFF22D3EE), Color(0xFF0E9FB3)]), const SizedBox(height: 14), resultBox('Birthday Reminder', nextBirthday.isEmpty ? 'Select date to see next birthday' : nextBirthday, Icons.celebration_rounded, const [Color(0xFFFFA733), Color(0xFFFF7C00)])]))))); }
+  @override Widget build(BuildContext context) { final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity; return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Age Calculator', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText)), body: Center(child: Container(width: maxWidth, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF050505), const Color(0xFF000000)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.all(14), child: Column(children: [glass(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Person Name', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 12), TextField(controller: nameController, onChanged: (_) => saveRecord(), decoration: InputDecoration(hintText: 'Enter name, e.g. Masum', filled: true, fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: const Icon(Icons.person_rounded, color: Colors.cyanAccent)))])), const SizedBox(height: 14), glass(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Date of Birth', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 12), PressScale(borderRadius: BorderRadius.circular(20), onTap: pickBirthDate, child: Container(width: double.infinity, padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB), borderRadius: BorderRadius.circular(20)), child: Row(children: [const Icon(Icons.calendar_month_rounded, color: Colors.cyanAccent), const SizedBox(width: 12), Expanded(child: Text(birthDate == null ? 'Tap to select date' : formatDate(birthDate!), style: TextStyle(color: birthDate == null ? mutedText : mainText, fontSize: 18, fontWeight: FontWeight.w800))), const Icon(Icons.arrow_forward_ios_rounded, size: 16, color: Colors.cyanAccent)])))])), const SizedBox(height: 14), resultBox('Your Age', ageResult, Icons.cake_rounded, const [Color(0xFF22D3EE), Color(0xFF0E9FB3)]), const SizedBox(height: 14), resultBox('Birthday Reminder', nextBirthday.isEmpty ? 'Select date to see next birthday' : nextBirthday, Icons.celebration_rounded, const [Color(0xFFFFA733), Color(0xFFFF7C00)])]))))); }
 }
 
 class BMICalculatorPage extends StatefulWidget {
@@ -1240,10 +2033,10 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
   double animatedBmiTarget = 0;
   double animatedHealthTarget = 0;
 
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517);
   Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
-  Color get card2 => widget.darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB);
+  Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB);
 
   @override
   void dispose() {
@@ -1351,7 +2144,7 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
         gradient: LinearGradient(
-          colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)] : [Colors.white, const Color(0xFFE8F2FB)],
+          colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8F2FB)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
         ),
@@ -1381,7 +2174,7 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
             hintText: hint,
             hintStyle: TextStyle(color: mutedText),
             filled: true,
-            fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB),
+            fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
             prefixIcon: Icon(icon, color: Colors.cyanAccent),
           ),
@@ -1478,7 +2271,7 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
                 child: LinearProgressIndicator(
                   value: progress,
                   minHeight: 10,
-                  backgroundColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFE8F2FB),
+                  backgroundColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFE8F2FB),
                   valueColor: AlwaysStoppedAnimation<Color>(statusColor()),
                 ),
               ),
@@ -1511,7 +2304,7 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
           width: maxWidth,
           decoration: BoxDecoration(
             gradient: LinearGradient(
-              colors: widget.darkMode ? [const Color(0xFF06101F), const Color(0xFF020611)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)],
+              colors: widget.darkMode ? [const Color(0xFF050505), const Color(0xFF000000)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)],
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
             ),
@@ -1570,7 +2363,7 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
 class DiscountCalculatorPage extends StatefulWidget { final bool darkMode; const DiscountCalculatorPage({super.key, required this.darkMode}); @override State<DiscountCalculatorPage> createState() => _DiscountCalculatorPageState(); }
 class _DiscountCalculatorPageState extends ToolPageBase<DiscountCalculatorPage> {
   final priceController = TextEditingController(); final discountController = TextEditingController(); String finalPrice = '0', savedAmount = '0', message = 'Enter price and discount to calculate.', lastSig = '';
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB); Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323); Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070); Color get card2 => widget.darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB); Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517); Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070); Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB);
   @override void dispose() { priceController.dispose(); discountController.dispose(); super.dispose(); }
   void saveRecord(double p, double d, String f, String s) { final sig = 'Discount|$p|$d|$f|$s'; if (sig == lastSig) return; lastSig = sig; saveSmartToolHistory(SmartToolHistoryItem(type: 'Discount', title: 'Discount ${money(d)}%', details: 'Price: ${money(p)} → Final: $f | Saved: $s Taka', dateTime: DateTime.now())); }
   void calculateDiscount() { final p = double.tryParse(priceController.text.trim()); final d = double.tryParse(discountController.text.trim()); if (p == null || d == null || p <= 0 || d < 0 || d > 100) { setState(() { finalPrice = d != null && (d < 0 || d > 100) ? '-' : '0'; savedAmount = finalPrice == '-' ? '-' : '0'; message = d != null && (d < 0 || d > 100) ? 'Discount must be between 0% and 100%.' : 'Enter valid price and discount.'; }); return; } final save = p * d / 100, pay = p - save; setState(() { finalPrice = money(pay); savedAmount = money(save); message = d == 0 ? 'No discount applied.' : d < 10 ? 'Small discount, but still some savings.' : d < 30 ? 'Good deal! You are saving a nice amount.' : d < 60 ? 'Great deal! This discount is valuable.' : 'Excellent deal! Huge savings.'; }); saveRecord(p, d, finalPrice, savedAmount); }
@@ -1582,9 +2375,9 @@ class _DiscountCalculatorPageState extends ToolPageBase<DiscountCalculatorPage> 
     );
   }
 
-  Widget glass(Widget child) => Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)] : [Colors.white, const Color(0xFFE8F2FB)]), borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.80))), child: child);
-  Widget input(String label, String hint, IconData icon, TextEditingController c) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(label, style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 10), TextField(controller: c, keyboardType: const TextInputType.numberWithOptions(decimal: true), onChanged: (_) => calculateDiscount(), style: TextStyle(color: mainText, fontSize: 22, fontWeight: FontWeight.bold), decoration: InputDecoration(hintText: hint, filled: true, fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: Icon(icon, color: Colors.orangeAccent))) ]);
-  @override Widget build(BuildContext context) { final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity; return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Discount Calculator', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText), actions: [IconButton(onPressed: shareDiscountResult, icon: const Icon(Icons.share_rounded, color: Colors.cyanAccent))]), body: Center(child: Container(width: maxWidth, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF06101F), const Color(0xFF020611)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.all(14), child: Column(children: [glass(Column(children: [input('Original Price', 'Enter price', Icons.payments_rounded, priceController), const SizedBox(height: 16), input('Discount Percent', 'Enter discount %', Icons.percent_rounded, discountController)])), const SizedBox(height: 14), glass(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Final Price', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), Row(crossAxisAlignment: CrossAxisAlignment.end, children: [Text(finalPrice, style: TextStyle(color: finalPrice == '-' ? Colors.redAccent : Colors.greenAccent, fontSize: 48, fontWeight: FontWeight.w900)), Padding(padding: const EdgeInsets.only(bottom: 10, left: 6), child: Text('Taka', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)))]), Text(message, style: TextStyle(color: mutedText, fontWeight: FontWeight.w700))])), const SizedBox(height: 14), glass(ListTile(leading: const Icon(Icons.savings_rounded, color: Colors.orangeAccent), title: Text('You Save', style: TextStyle(color: mutedText)), subtitle: Text('$savedAmount Taka', style: TextStyle(color: mainText, fontSize: 22, fontWeight: FontWeight.w900)))), const SizedBox(height: 14), Container(width: double.infinity, padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: card2, borderRadius: BorderRadius.circular(20)), child: Text('Example: Price 1000, Discount 20% = Final Price 800, Save 200', style: TextStyle(color: mutedText)))]))))); }
+  Widget glass(Widget child) => Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8F2FB)]), borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white.withOpacity(0.12) : Colors.white.withOpacity(0.80))), child: child);
+  Widget input(String label, String hint, IconData icon, TextEditingController c) => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text(label, style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 10), TextField(controller: c, keyboardType: const TextInputType.numberWithOptions(decimal: true), onChanged: (_) => calculateDiscount(), style: TextStyle(color: mainText, fontSize: 22, fontWeight: FontWeight.bold), decoration: InputDecoration(hintText: hint, filled: true, fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: Icon(icon, color: Colors.orangeAccent))) ]);
+  @override Widget build(BuildContext context) { final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity; return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Discount Calculator', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText), actions: [IconButton(onPressed: shareDiscountResult, icon: const Icon(Icons.share_rounded, color: Colors.cyanAccent))]), body: Center(child: Container(width: maxWidth, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF050505), const Color(0xFF000000)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.all(14), child: Column(children: [glass(Column(children: [input('Original Price', 'Enter price', Icons.payments_rounded, priceController), const SizedBox(height: 16), input('Discount Percent', 'Enter discount %', Icons.percent_rounded, discountController)])), const SizedBox(height: 14), glass(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Final Price', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), Row(crossAxisAlignment: CrossAxisAlignment.end, children: [Text(finalPrice, style: TextStyle(color: finalPrice == '-' ? Colors.redAccent : Colors.greenAccent, fontSize: 48, fontWeight: FontWeight.w900)), Padding(padding: const EdgeInsets.only(bottom: 10, left: 6), child: Text('Taka', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)))]), Text(message, style: TextStyle(color: mutedText, fontWeight: FontWeight.w700))])), const SizedBox(height: 14), glass(ListTile(leading: const Icon(Icons.savings_rounded, color: Colors.orangeAccent), title: Text('You Save', style: TextStyle(color: mutedText)), subtitle: Text('$savedAmount Taka', style: TextStyle(color: mainText, fontSize: 22, fontWeight: FontWeight.w900)))), const SizedBox(height: 14), Container(width: double.infinity, padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: card2, borderRadius: BorderRadius.circular(20)), child: Text('Example: Price 1000, Discount 20% = Final Price 800, Save 200', style: TextStyle(color: mutedText)))]))))); }
 }
 
 
@@ -1600,9 +2393,9 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
   List<SmartToolHistoryItem> items = [];
   int tab = 0;
 
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get card => widget.darkMode ? const Color(0xFF0E1B2C) : Colors.white;
-  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get card => widget.darkMode ? const Color(0xFF111214) : Colors.white;
+  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517);
   Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
 
   @override
@@ -1633,6 +2426,137 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
     return tab == 0
         ? items.where((item) => !item.isDeleted).toList()
         : items.where((item) => item.isDeleted).toList();
+  }
+
+  String personNameForReport(SmartToolHistoryItem item) {
+    final patterns = <RegExp>[
+      RegExp(r'Customer:\s*([^\n|]+)', caseSensitive: false),
+      RegExp(r'Person:\s*([^\n|]+)', caseSensitive: false),
+      RegExp(r'Name:\s*([^\n|]+)', caseSensitive: false),
+      RegExp(r'User:\s*([^\n|]+)', caseSensitive: false),
+    ];
+
+    for (final pattern in patterns) {
+      final match = pattern.firstMatch(item.details);
+      final value = match?.group(1)?.trim() ?? '';
+      if (value.isNotEmpty) return value;
+    }
+
+    if (item.type == 'Age' && item.title.toLowerCase().endsWith(' age')) {
+      final value = item.title.substring(0, item.title.length - 4).trim();
+      if (value.isNotEmpty) return value;
+    }
+
+    return 'No Person';
+  }
+
+  List<String> personNamesForExport() {
+    final names = exportItems()
+        .map(personNameForReport)
+        .where((name) => name.trim().isNotEmpty && name != 'No Person')
+        .toSet()
+        .toList();
+    names.sort((a, b) => a.toLowerCase().compareTo(b.toLowerCase()));
+    return names;
+  }
+
+  String safeReportName(String value) {
+    final cleaned = value
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+        .replaceAll(RegExp(r'_+'), '_')
+        .replaceAll(RegExp(r'^_|_\$'), '');
+    return cleaned.isEmpty ? 'person' : cleaned;
+  }
+
+  void showExportOptions() {
+    final list = exportItems();
+    if (list.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No history found to export')),
+      );
+      return;
+    }
+
+    final names = personNamesForExport();
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: card,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (_) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(
+                  child: Container(
+                    width: 46,
+                    height: 5,
+                    decoration: BoxDecoration(
+                      color: mutedText.withOpacity(0.35),
+                      borderRadius: BorderRadius.circular(99),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Text('Download PDF', style: TextStyle(color: mainText, fontSize: 22, fontWeight: FontWeight.w900)),
+                const SizedBox(height: 8),
+                Text('All records অথবা person/customer অনুযায়ী আলাদা PDF download করো।', style: TextStyle(color: mutedText, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 14),
+                ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.picture_as_pdf_rounded, color: Colors.orangeAccent),
+                  title: Text('All Records PDF', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)),
+                  subtitle: Text('${list.length} records একসাথে', style: TextStyle(color: mutedText)),
+                  onTap: () {
+                    Navigator.pop(context);
+                    exportHistoryReport();
+                  },
+                ),
+                if (names.isNotEmpty) ...[
+                  const Divider(),
+                  Flexible(
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: names.length,
+                      itemBuilder: (context, i) {
+                        final name = names[i];
+                        final personList = list.where((item) => personNameForReport(item).toLowerCase() == name.toLowerCase()).toList();
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.person_rounded, color: Colors.cyanAccent),
+                          title: Text(name, style: TextStyle(color: mainText, fontWeight: FontWeight.w900)),
+                          subtitle: Text('${personList.length} records', style: TextStyle(color: mutedText)),
+                          trailing: const Icon(Icons.download_rounded, color: Colors.orangeAccent),
+                          onTap: () {
+                            Navigator.pop(context);
+                            exportHistoryReport(
+                              customList: personList,
+                              customTitle: '$name Smart History Report',
+                              customFileName: 'masum_${safeReportName(name)}_smart_history.pdf',
+                            );
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                ] else
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Text('এই records গুলোতে Customer/Person name পাওয়া যায়নি।', style: TextStyle(color: mutedText)),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   String formatDate(DateTime d) {
@@ -1734,8 +2658,9 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
     ''';
   }
 
-  Future<void> exportHistoryReport() async {
-    final list = exportItems();
+  Future<void> exportHistoryReport({List<SmartToolHistoryItem>? customList, String? customTitle, String? customFileName}) async {
+    final list = customList ?? exportItems();
+    final reportTitle = customTitle ?? (tab == 0 ? 'Smart History Report' : 'Deleted Smart History Report');
 
     if (list.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1766,7 +2691,7 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
     }
 
     final buffer = StringBuffer()
-      ..writeln(tab == 0 ? 'Smart History Report' : 'Deleted Smart History Report')
+      ..writeln(reportTitle)
       ..writeln('Generated: ${DateTime.now()}')
       ..writeln('Total Records: ${list.length}')
       ..writeln('');
@@ -1794,9 +2719,9 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
 
     await exportTextPdf(
       context,
-      title: tab == 0 ? 'Smart History Report' : 'Deleted Smart History Report',
+      title: reportTitle,
       text: buffer.toString(),
-      fileName: tab == 0 ? 'masum_smart_history_report.pdf' : 'masum_deleted_history_report.pdf',
+      fileName: customFileName ?? (tab == 0 ? 'masum_smart_history_report.pdf' : 'masum_deleted_history_report.pdf'),
     );
   }
 
@@ -1865,7 +2790,7 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: widget.darkMode
-              ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)]
+              ? [const Color(0xFF1C1C1E), const Color(0xFF111214)]
               : [Colors.white, const Color(0xFFE8F2FB)],
         ),
         borderRadius: BorderRadius.circular(24),
@@ -1921,8 +2846,8 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
         actions: [
           IconButton(
             tooltip: 'Download report',
-            onPressed: indexes.isEmpty ? null : exportHistoryReport,
-            icon: const Icon(Icons.download_rounded, color: Colors.cyanAccent),
+            onPressed: indexes.isEmpty ? null : showExportOptions,
+            icon: const Icon(Icons.download_rounded, color: Colors.orangeAccent),
           ),
           IconButton(
             tooltip: tab == 0 ? 'Move all to Deleted' : 'Permanent delete all',
@@ -1946,7 +2871,7 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
           decoration: BoxDecoration(
             gradient: LinearGradient(
               colors: widget.darkMode
-                  ? [const Color(0xFF06101F), const Color(0xFF020611)]
+                  ? [const Color(0xFF050505), const Color(0xFF000000)]
                   : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)],
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
@@ -2000,10 +2925,10 @@ class _ProfitLossCalculatorPageState extends ToolPageBase<ProfitLossCalculatorPa
   String message = 'Profit or loss result will show here.';
   String lastSig = '';
 
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517);
   Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
-  Color get card2 => widget.darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB);
+  Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB);
 
   @override
   void dispose() {
@@ -2131,7 +3056,7 @@ class _ProfitLossCalculatorPageState extends ToolPageBase<ProfitLossCalculatorPa
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: widget.darkMode
-              ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)]
+              ? [const Color(0xFF1C1C1E), const Color(0xFF111214)]
               : [Colors.white, const Color(0xFFE8F2FB)],
         ),
         borderRadius: BorderRadius.circular(26),
@@ -2169,7 +3094,7 @@ class _ProfitLossCalculatorPageState extends ToolPageBase<ProfitLossCalculatorPa
             hintText: hint,
             hintStyle: TextStyle(color: mutedText),
             filled: true,
-            fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB),
+            fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(18),
               borderSide: BorderSide.none,
@@ -2196,7 +3121,7 @@ class _ProfitLossCalculatorPageState extends ToolPageBase<ProfitLossCalculatorPa
             hintText: hint,
             hintStyle: TextStyle(color: mutedText),
             filled: true,
-            fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB),
+            fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(18),
               borderSide: BorderSide.none,
@@ -2275,7 +3200,7 @@ class _ProfitLossCalculatorPageState extends ToolPageBase<ProfitLossCalculatorPa
           decoration: BoxDecoration(
             gradient: LinearGradient(
               colors: widget.darkMode
-                  ? [const Color(0xFF06101F), const Color(0xFF020611)]
+                  ? [const Color(0xFF050505), const Color(0xFF000000)]
                   : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)],
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
@@ -2385,10 +3310,10 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
   String message = 'Enter loan amount, rate and time.';
   String lastSig = '';
 
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517);
   Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
-  Color get card2 => widget.darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB);
+  Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB);
 
   @override
   void dispose() {
@@ -2517,7 +3442,7 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: widget.darkMode
-              ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)]
+              ? [const Color(0xFF1C1C1E), const Color(0xFF111214)]
               : [Colors.white, const Color(0xFFE8F2FB)],
         ),
         borderRadius: BorderRadius.circular(26),
@@ -2556,7 +3481,7 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
             hintText: hint,
             hintStyle: TextStyle(color: mutedText),
             filled: true,
-            fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB),
+            fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
             prefixIcon: Icon(icon, color: Colors.cyanAccent),
           ),
@@ -2579,7 +3504,7 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
             hintText: hint,
             hintStyle: TextStyle(color: mutedText),
             filled: true,
-            fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB),
+            fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB),
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
             prefixIcon: Icon(icon, color: Colors.cyanAccent),
           ),
@@ -2695,7 +3620,7 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
           decoration: BoxDecoration(
             gradient: LinearGradient(
               colors: widget.darkMode
-                  ? [const Color(0xFF06101F), const Color(0xFF020611)]
+                  ? [const Color(0xFF050505), const Color(0xFF000000)]
                   : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)],
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
@@ -2795,11 +3720,11 @@ class AboutDeveloperPage extends StatelessWidget {
   static const String emailAddress = 'farabi13577@gmail.com';
   static const String portfolioUrl = 'https://masum462441.github.io/portfolio/';
 
-  Color get bg => darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB);
-  Color get mainText => darkMode ? Colors.white : const Color(0xFF071323);
+  Color get bg => darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get mainText => darkMode ? Colors.white : const Color(0xFF151517);
   Color get mutedText => darkMode ? Colors.white60 : const Color(0xFF526070);
-  Color get card => darkMode ? const Color(0xFF0E1B2C) : Colors.white;
-  Color get card2 => darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB);
+  Color get card => darkMode ? const Color(0xFF111214) : Colors.white;
+  Color get card2 => darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB);
 
   void openUrl(String url) {
     openExternalUrl(url);
@@ -2825,7 +3750,7 @@ class AboutDeveloperPage extends StatelessWidget {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        backgroundColor: darkMode ? const Color(0xFF0E1B2C) : Colors.white,
+        backgroundColor: darkMode ? const Color(0xFF111214) : Colors.white,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(26)),
         titlePadding: const EdgeInsets.fromLTRB(22, 22, 22, 6),
         contentPadding: const EdgeInsets.fromLTRB(22, 12, 22, 8),
@@ -2858,7 +3783,7 @@ class AboutDeveloperPage extends StatelessWidget {
             hintText: 'Write what you like, problem, or suggestion...',
             hintStyle: TextStyle(color: mutedText),
             filled: true,
-            fillColor: darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB),
+            fillColor: darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(18),
               borderSide: BorderSide.none,
@@ -2913,7 +3838,7 @@ class AboutDeveloperPage extends StatelessWidget {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: darkMode
-              ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)]
+              ? [const Color(0xFF1C1C1E), const Color(0xFF111214)]
               : [Colors.white, const Color(0xFFE8F2FB)],
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
@@ -3030,20 +3955,26 @@ class AboutDeveloperPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  'Developer of $appName',
+                  'Flutter App Developer',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: mutedText, fontSize: 14, height: 1.35, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 7),
+                Text(
+                  'Verified Developer • Bangladesh',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: const Color(0xFF30C96B), fontSize: 12, height: 1.35, fontWeight: FontWeight.w900),
                 ),
                 const SizedBox(height: 16),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
                   decoration: BoxDecoration(
-                    color: darkMode ? const Color(0xFF071323).withOpacity(0.72) : Colors.white.withOpacity(0.72),
+                    color: darkMode ? const Color(0xFF151517).withOpacity(0.72) : Colors.white.withOpacity(0.72),
                     borderRadius: BorderRadius.circular(18),
                     border: Border.all(color: Colors.cyanAccent.withOpacity(0.18)),
                   ),
                   child: const Text(
-                    'Calculator • Business Tools • Smart Records',
+                    'Smart Calculator • Business Tools • PDF Reports',
                     textAlign: TextAlign.center,
                     style: TextStyle(color: Colors.cyanAccent, fontSize: 12, fontWeight: FontWeight.w900),
                   ),
@@ -3087,11 +4018,11 @@ class AboutDeveloperPage extends StatelessWidget {
   Widget quickStats() {
     return Row(
       children: [
-        Expanded(child: statBox('Tools', '8+', Icons.apps_rounded, const [Color(0xFF22D3EE), Color(0xFF0E9FB3)])),
+        Expanded(child: statBox('Tools', '12+', Icons.apps_rounded, const [Color(0xFF22D3EE), Color(0xFF0E9FB3)])),
         const SizedBox(width: 10),
         Expanded(child: statBox('Mode', 'Pro', Icons.workspace_premium_rounded, const [Color(0xFFFFA733), Color(0xFFFF7C00)])),
         const SizedBox(width: 10),
-        Expanded(child: statBox('Build', '36', Icons.rocket_launch_rounded, const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)])),
+        Expanded(child: statBox('Build', '36.3', Icons.rocket_launch_rounded, const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)])),
       ],
     );
   }
@@ -3222,12 +4153,12 @@ class AboutDeveloperPage extends StatelessWidget {
       child: Column(
         children: [
           Text(
-            'Made with ❤️ by Masum',
+            'Built with care by Masum',
             style: TextStyle(color: mainText, fontSize: 16, fontWeight: FontWeight.w900),
           ),
           const SizedBox(height: 6),
           Text(
-            'Portfolio, WhatsApp and Feedback are connected. Users can send feedback to your Gmail.',
+            'Made for daily calculation, smart records and small business support. Portfolio, WhatsApp and Feedback are connected.',
             textAlign: TextAlign.center,
             style: TextStyle(color: mutedText, height: 1.35, fontWeight: FontWeight.w600),
           ),
@@ -3254,7 +4185,7 @@ class AboutDeveloperPage extends StatelessWidget {
           decoration: BoxDecoration(
             gradient: LinearGradient(
               colors: darkMode
-                  ? [const Color(0xFF06101F), const Color(0xFF020611)]
+                  ? [const Color(0xFF050505), const Color(0xFF000000)]
                   : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)],
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
@@ -3275,9 +4206,11 @@ class AboutDeveloperPage extends StatelessWidget {
                         const SizedBox(height: 16),
                         infoRow(Icons.public_rounded, 'Portfolio', portfolioUrl, const [Color(0xFF00C9FF), Color(0xFF0072FF)]),
                         const SizedBox(height: 16),
-                        infoRow(Icons.verified_rounded, 'Version', 'Step 36.3 Premium Build', const [Color(0xFF30C96B), Color(0xFF0F9D58)]),
+                        infoRow(Icons.verified_rounded, 'Version', 'Version 1.0.0\nBuild 36.3\nPremium Edition', const [Color(0xFF30C96B), Color(0xFF0F9D58)]),
                         const SizedBox(height: 16),
                         infoRow(Icons.favorite_rounded, 'Purpose', 'Daily calculator, smart tools and small business records.', const [Color(0xFFFFA733), Color(0xFFFF7C00)]),
+                        const SizedBox(height: 16),
+                        infoRow(Icons.auto_awesome_rounded, 'Why this app?', 'Fast calculation, smart records, person-wise PDF and useful business tools in one app.', const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)]),
                       ],
                     ),
                   ),
@@ -3295,7 +4228,7 @@ class AboutDeveloperPage extends StatelessWidget {
                 AnimatedFadeSlide(delayMs: 320, child: contactButton(
                     icon: Icons.chat_rounded,
                     title: 'WhatsApp Support',
-                    subtitle: '+$whatsappNumber',
+                    subtitle: '+$whatsappNumber • Support: 10:00 AM - 10:00 PM',
                     colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)],
                     onTap: openWhatsApp,
                   ),
@@ -3327,11 +4260,1007 @@ class AboutDeveloperPage extends StatelessWidget {
 }
 
 
+
+
+class PinLockGate extends StatefulWidget {
+  final Widget child;
+  final bool darkMode;
+  const PinLockGate({super.key, required this.child, required this.darkMode});
+
+  @override
+  State<PinLockGate> createState() => _PinLockGateState();
+}
+
+class _PinLockGateState extends State<PinLockGate> {
+  bool loading = true;
+  bool enabled = false;
+  bool hasPinData = false;
+  final pinController = TextEditingController();
+  String error = '';
+
+  @override
+  void initState() {
+    super.initState();
+    loadPin();
+  }
+
+  @override
+  void dispose() {
+    pinController.dispose();
+    super.dispose();
+  }
+
+  Future<void> loadPin() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      enabled = prefs.getBool('pin_lock_enabled') ?? false;
+      final oldRawPin = prefs.getString('pin_lock_code') ?? '';
+      final hash = prefs.getString('pin_lock_hash') ?? '';
+      hasPinData = oldRawPin.isNotEmpty || hash.isNotEmpty;
+      loading = false;
+    });
+  }
+
+  Future<void> unlock() async {
+    if (await verifySavedPinCode(pinController.text.trim())) {
+      if (!mounted) return;
+      setState(() => enabled = false);
+    } else {
+      if (!mounted) return;
+      setState(() => error = 'Wrong PIN');
+      HapticFeedback.mediumImpact();
+    }
+  }
+
+  Future<String?> askText({required String title, required String hint, bool pin = false}) async {
+    return masumInputDialog(context, title: title, hint: hint, pin: pin);
+  }
+
+  Future<String?> askNewPinDialog() async {
+    final first = TextEditingController();
+    final second = TextEditingController();
+    String localError = '';
+    final result = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text('Set New PIN'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: first,
+                autofocus: true,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                maxLength: 4,
+                decoration: const InputDecoration(counterText: '', hintText: 'Enter 4 digit new PIN'),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: second,
+                obscureText: true,
+                keyboardType: TextInputType.number,
+                maxLength: 4,
+                decoration: const InputDecoration(counterText: '', hintText: 'Confirm 4 digit PIN'),
+              ),
+              if (localError.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Text(localError, style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+            ElevatedButton(
+              onPressed: () {
+                final a = first.text.trim();
+                final b = second.text.trim();
+                if (a.length != 4 || int.tryParse(a) == null) {
+                  setDialogState(() => localError = '4 digit PIN দিন');
+                  return;
+                }
+                if (a != b) {
+                  setDialogState(() => localError = 'Confirm PIN মিলছে না');
+                  return;
+                }
+                FocusScope.of(dialogContext).unfocus();
+                Navigator.pop(dialogContext, a);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    first.dispose();
+    second.dispose();
+    return result;
+  }
+
+  Future<void> setNewPinAfterRecovery() async {
+    final newPin = await askNewPinDialog();
+    if (newPin == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    final salt = generateSecuritySalt();
+    await prefs.setBool('pin_lock_enabled', true);
+    await prefs.setString('pin_lock_salt', salt);
+    await prefs.setString('pin_lock_hash', masumSecureHash(newPin, salt));
+    await prefs.remove('pin_lock_code');
+    AuthBackupService.scheduleAutoBackup();
+    if (!mounted) return;
+    pinController.clear();
+    setState(() {
+      enabled = false;
+      error = '';
+    });
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN reset completed')));
+  }
+
+  Future<void> resetWithRecoveryCode() async {
+    final code = await masumInputDialog(context, title: 'Recovery Code', hint: 'MASUM-0000-0000', initialValue: 'MASUM-');
+    if (code == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    final salt = prefs.getString('pin_recovery_code_salt') ?? '';
+    final hash = prefs.getString('pin_recovery_code_hash') ?? '';
+    final cleanCode = code.trim().toUpperCase().replaceAll(' ', '');
+    if (salt.isNotEmpty && hash.isNotEmpty && masumSecureHash(cleanCode, salt) == hash) {
+      await setNewPinAfterRecovery();
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Recovery code ভুল')));
+    }
+  }
+
+  Future<void> resetWithGmail() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final savedUid = prefs.getString('pin_recovery_uid') ?? '';
+      final savedEmail = prefs.getString('pin_recovery_email') ?? '';
+      if (savedUid.isEmpty) {
+        if (!mounted) return;
+        await masumInfoDialog(context, 'Gmail Recovery Not Setup', 'এই PIN-এর জন্য Gmail recovery আগে connect করা হয়নি। App Lock settings থেকে Connect Gmail Recovery চাপলে পরেরবার Google account verify করে reset হবে। এখন Recovery Code ব্যবহার করো।');
+        return;
+      }
+      await masumInfoDialog(context, 'Gmail Verify', 'Gmail recovery-তে email OTP যায় না। নিরাপত্তার জন্য Google account আবার select/login করতে হবে। একই Gmail verify হলে নতুন PIN set করা যাবে।');
+      final user = await AuthBackupService.signInWithGoogle(forceAccountPicker: true);
+      if (user == null) return;
+      if (user.uid != savedUid) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('এই Gmail দিয়ে recovery হবে না। Setup Gmail: ${savedEmail.isEmpty ? 'unknown' : savedEmail}')));
+        }
+        return;
+      }
+      await setNewPinAfterRecovery();
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gmail recovery failed: $e')));
+    }
+  }
+
+  Future<void> phoneOtpDisabledInfo() async {
+    await masumInfoDialog(context, 'Phone OTP disabled', 'Phone OTP চালাতে Firebase Blaze/Billing লাগে। তাই এই version-এ Phone OTP recovery বন্ধ রাখা হয়েছে। Recovery Code বা Gmail Verify ব্যবহার করো।');
+  }
+
+  Future<void> resetAppLockLocal() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Reset App Lock?'),
+        content: const Text('এটা শুধু PIN lock remove করবে। Business data delete হবে না। Phone আপনার নিজের হলে Continue চাপুন।'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+          ElevatedButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Continue')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('pin_lock_enabled', false);
+    await prefs.remove('pin_lock_code');
+    await prefs.remove('pin_lock_hash');
+    await prefs.remove('pin_lock_salt');
+    AuthBackupService.scheduleAutoBackup();
+    if (!mounted) return;
+    setState(() {
+      enabled = false;
+      error = '';
+      pinController.clear();
+    });
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('App Lock reset done')));
+  }
+
+  void forgotPinSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: widget.darkMode ? const Color(0xFF111214) : Colors.white,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(26))),
+      builder: (sheetContext) => Padding(
+        padding: const EdgeInsets.all(18),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('Forgot PIN?', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
+          const SizedBox(height: 8),
+          const Text('Phone OTP billing লাগে, তাই এখন Recovery Code অথবা Gmail Verify ব্যবহার করো।', textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          ListTile(
+            leading: const Icon(Icons.vpn_key_rounded, color: Colors.cyan),
+            title: const Text('Reset with Recovery Code'),
+            subtitle: const Text('Saved recovery code দিয়ে reset'),
+            onTap: () async {
+              Navigator.of(sheetContext).pop();
+              await Future.delayed(const Duration(milliseconds: 260));
+              if (mounted) resetWithRecoveryCode();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.email_rounded, color: Colors.orangeAccent),
+            title: const Text('Reset with Gmail Verify'),
+            subtitle: const Text('Same Gmail আবার verify করলে reset হবে'),
+            onTap: () async {
+              Navigator.of(sheetContext).pop();
+              await Future.delayed(const Duration(milliseconds: 260));
+              if (mounted) resetWithGmail();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.phone_disabled_rounded, color: Colors.grey),
+            title: const Text('Phone OTP disabled'),
+            subtitle: const Text('Firebase Billing লাগবে'),
+            onTap: () async {
+              Navigator.of(sheetContext).pop();
+              await Future.delayed(const Duration(milliseconds: 260));
+              if (mounted) phoneOtpDisabledInfo();
+            },
+          ),
+          ListTile(
+            leading: const Icon(Icons.lock_reset_rounded, color: Colors.redAccent),
+            title: const Text('Reset App Lock'),
+            subtitle: const Text('শুধু PIN lock remove হবে, data delete হবে না'),
+            onTap: () async {
+              Navigator.of(sheetContext).pop();
+              await Future.delayed(const Duration(milliseconds: 260));
+              if (mounted) resetAppLockLocal();
+            },
+          ),
+        ]),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading || !enabled || !hasPinData) return widget.child;
+    final bg = widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+    final card = widget.darkMode ? const Color(0xFF111214) : Colors.white;
+    final mainText = widget.darkMode ? Colors.white : const Color(0xFF111111);
+    final muted = widget.darkMode ? Colors.white60 : const Color(0xFF526070);
+    return Scaffold(
+      backgroundColor: bg,
+      body: Center(
+        child: Container(
+          width: MediaQuery.of(context).size.width > 700 ? 420 : double.infinity,
+          padding: const EdgeInsets.all(22),
+          child: Container(
+            padding: const EdgeInsets.all(22),
+            decoration: BoxDecoration(
+              color: card,
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(color: widget.darkMode ? Colors.white12 : Colors.black12),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(height: 70, width: 70, decoration: BoxDecoration(gradient: const LinearGradient(colors: [Color(0xFFFFB143), Color(0xFFFF7C00)]), borderRadius: BorderRadius.circular(24)), child: const Icon(Icons.lock_rounded, color: Colors.white, size: 34)),
+                const SizedBox(height: 16),
+                Text('Masum App Lock', style: TextStyle(color: mainText, fontSize: 24, fontWeight: FontWeight.w900)),
+                const SizedBox(height: 8),
+                Text('Enter your 4 digit PIN', style: TextStyle(color: muted, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 18),
+                TextField(
+                  controller: pinController,
+                  obscureText: true,
+                  keyboardType: TextInputType.number,
+                  maxLength: 4,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: mainText, fontSize: 24, fontWeight: FontWeight.w900, letterSpacing: 8),
+                  decoration: InputDecoration(counterText: '', filled: true, fillColor: widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), errorText: error.isEmpty ? null : error),
+                  onSubmitted: (_) { unlock(); },
+                ),
+                const SizedBox(height: 16),
+                SizedBox(width: double.infinity, height: 52, child: ElevatedButton.icon(onPressed: () { unlock(); }, icon: const Icon(Icons.lock_open_rounded), label: const Text('Unlock'))),
+                const SizedBox(height: 8),
+                TextButton(onPressed: forgotPinSheet, child: const Text('Forgot PIN?')),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class PinLockSettingsPage extends StatefulWidget {
+  final bool darkMode;
+  const PinLockSettingsPage({super.key, required this.darkMode});
+
+  @override
+  State<PinLockSettingsPage> createState() => _PinLockSettingsPageState();
+}
+
+class _PinLockSettingsPageState extends State<PinLockSettingsPage> {
+  final pinController = TextEditingController();
+  final confirmPinController = TextEditingController();
+  final phoneController = TextEditingController();
+  String lastRecoveryCode = '';
+  bool enabled = false;
+  bool phoneVerified = false;
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get card => widget.darkMode ? const Color(0xFF111214) : Colors.white;
+  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF111111);
+  Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
+
+  @override
+  void initState() {
+    super.initState();
+    loadPinState();
+  }
+
+  @override
+  void dispose() {
+    pinController.dispose();
+    confirmPinController.dispose();
+    phoneController.dispose();
+    super.dispose();
+  }
+
+  Future<void> loadPinState() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      enabled = prefs.getBool('pin_lock_enabled') ?? false;
+      phoneController.text = prefs.getString('pin_recovery_phone') ?? '';
+      phoneVerified = prefs.getBool('pin_recovery_phone_verified') ?? false;
+    });
+  }
+
+  Future<void> savePin() async {
+    final pin = pinController.text.trim();
+    final confirm = confirmPinController.text.trim();
+    if (pin.length != 4 || int.tryParse(pin) == null) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('4 digit number PIN দিন')));
+      return;
+    }
+    if (pin != confirm) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Confirm PIN মিলছে না')));
+      return;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final pinSalt = generateSecuritySalt();
+    final recoveryCode = generateRecoveryCode();
+    final recoverySalt = generateSecuritySalt();
+    await prefs.setBool('pin_lock_enabled', true);
+    await prefs.setString('pin_lock_salt', pinSalt);
+    await prefs.setString('pin_lock_hash', masumSecureHash(pin, pinSalt));
+    await prefs.remove('pin_lock_code');
+    await prefs.setString('pin_recovery_code_salt', recoverySalt);
+    await prefs.setString('pin_recovery_code_hash', masumSecureHash(recoveryCode, recoverySalt));
+    final currentUser = AuthBackupService.currentUser;
+    if (currentUser != null) {
+      await prefs.setString('pin_recovery_uid', currentUser.uid);
+      await prefs.setString('pin_recovery_email', currentUser.email ?? '');
+    }
+    final enteredPhone = normalizeBangladeshPhone(phoneController.text.trim());
+    if (enteredPhone.isNotEmpty) {
+      final oldPhone = prefs.getString('pin_recovery_phone') ?? '';
+      final oldVerified = prefs.getBool('pin_recovery_phone_verified') ?? false;
+      await prefs.setString('pin_recovery_phone', enteredPhone);
+      await prefs.setBool('pin_recovery_phone_verified', oldVerified && oldPhone == enteredPhone);
+    }
+    AuthBackupService.scheduleAutoBackup();
+    if (!mounted) return;
+    setState(() { enabled = true; lastRecoveryCode = recoveryCode; phoneVerified = prefs.getBool('pin_recovery_phone_verified') ?? false; });
+    pinController.clear();
+    confirmPinController.clear();
+    showDialog(context: context, builder: (_) => AlertDialog(
+      title: const Text('Recovery Code Save করো'),
+      content: SelectableText('PIN ভুলে গেলে এই code দিয়ে reset করতে পারবে:\n\n$recoveryCode\n\nএটা screenshot নিয়ে রাখো বা খাতায় লিখে রাখো।'),
+      actions: [ElevatedButton(onPressed: () => Navigator.pop(context), child: const Text('Saved'))],
+    ));
+  }
+
+  Future<void> setupGmailRecovery() async {
+    try {
+      var user = AuthBackupService.currentUser;
+      user ??= await AuthBackupService.signInWithGoogle();
+      if (user == null) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Gmail login cancel হয়েছে')));
+        return;
+      }
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('pin_recovery_uid', user.uid);
+      await prefs.setString('pin_recovery_email', user.email ?? '');
+      AuthBackupService.scheduleAutoBackup();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gmail recovery connected: ${user.email ?? 'Gmail'}')));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gmail recovery failed: $e')));
+    }
+  }
+
+  Future<void> verifyPhoneRecovery() async {
+    final phone = phoneController.text.trim();
+    if (phone.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Phone number দাও')));
+      return;
+    }
+    final ok = await verifyPhoneOtpWithFirebase(context, phone);
+    if (!mounted) return;
+    if (ok) {
+      final prefs = await SharedPreferences.getInstance();
+      final normalizedPhone = normalizeBangladeshPhone(phone);
+      await prefs.setString('pin_recovery_phone', normalizedPhone);
+      await prefs.setBool('pin_recovery_phone_verified', true);
+      AuthBackupService.scheduleAutoBackup();
+      setState(() {
+        phoneController.text = normalizedPhone;
+        phoneVerified = true;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Phone recovery verified: $normalizedPhone')));
+    }
+  }
+
+  Future<void> disablePin() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('pin_lock_enabled', false);
+    await prefs.remove('pin_lock_code');
+    await prefs.remove('pin_lock_hash');
+    await prefs.remove('pin_lock_salt');
+    await prefs.remove('pin_recovery_code_hash');
+    await prefs.remove('pin_recovery_code_salt');
+    await prefs.remove('pin_recovery_email');
+    await prefs.remove('pin_recovery_uid');
+    await prefs.remove('pin_recovery_phone');
+    await prefs.remove('pin_recovery_phone_verified');
+    AuthBackupService.scheduleAutoBackup();
+    if (!mounted) return;
+    setState(() => enabled = false);
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN lock disabled')));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity;
+    return Scaffold(
+      backgroundColor: bg,
+      appBar: AppBar(backgroundColor: bg, iconTheme: IconThemeData(color: mainText), title: Text('App Lock / PIN', style: TextStyle(color: mainText, fontWeight: FontWeight.w900))),
+      body: Center(
+        child: Container(
+          width: maxWidth,
+          padding: const EdgeInsets.all(16),
+          child: SingleChildScrollView(
+            child: Column(
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(18),
+                  decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(26), border: Border.all(color: widget.darkMode ? Colors.white12 : Colors.black12)),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text(enabled ? 'PIN Lock is ON' : 'PIN Lock is OFF', style: TextStyle(color: mainText, fontSize: 22, fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 8),
+                    Text('Customer notes, phone number, due records protect করার জন্য 4 digit PIN ব্যবহার করো।', style: TextStyle(color: mutedText, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 16),
+                    TextField(controller: pinController, keyboardType: TextInputType.number, maxLength: 4, obscureText: true, style: TextStyle(color: mainText, fontSize: 20, fontWeight: FontWeight.bold), decoration: InputDecoration(counterText: '', hintText: 'Enter 4 digit PIN', filled: true, fillColor: widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: const Icon(Icons.lock_rounded, color: Colors.orangeAccent))),
+                    const SizedBox(height: 10),
+                    TextField(controller: confirmPinController, keyboardType: TextInputType.number, maxLength: 4, obscureText: true, style: TextStyle(color: mainText, fontSize: 20, fontWeight: FontWeight.bold), decoration: InputDecoration(counterText: '', hintText: 'Confirm 4 digit PIN', filled: true, fillColor: widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: const Icon(Icons.verified_user_rounded, color: Colors.greenAccent))),
+                    const SizedBox(height: 10),
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF4F7FB),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: widget.darkMode ? Colors.white10 : Colors.black12),
+                      ),
+                      child: Text('Recovery: Recovery Code auto generate হবে। Gmail recovery connect করলে Forgot PIN থেকে Google account verify করে reset করা যাবে। Phone OTP আপাতত বন্ধ রাখা হয়েছে, কারণ Firebase Billing লাগে।', style: TextStyle(color: mutedText, fontSize: 12, height: 1.4, fontWeight: FontWeight.w700)),
+                    ),
+                    if (lastRecoveryCode.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 10), child: SelectableText('Recovery Code: $lastRecoveryCode', style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.w900))),
+                    const SizedBox(height: 10),
+                    SizedBox(width: double.infinity, height: 48, child: OutlinedButton.icon(onPressed: setupGmailRecovery, icon: const Icon(Icons.email_rounded), label: const Text('Connect Gmail Recovery'))),
+                    const SizedBox(height: 10),
+                    SizedBox(width: double.infinity, height: 48, child: OutlinedButton.icon(onPressed: () => masumInfoDialog(context, 'Phone OTP disabled', 'Phone OTP চালাতে Firebase Blaze/Billing লাগে। তাই এই version-এ Phone OTP recovery বন্ধ রাখা হয়েছে।'), icon: const Icon(Icons.phone_disabled_rounded), label: const Text('Phone OTP disabled'))),
+                    const SizedBox(height: 12),
+                    Row(children: [Expanded(child: ElevatedButton.icon(onPressed: savePin, icon: const Icon(Icons.save_rounded), label: Text(enabled ? 'Change PIN' : 'Enable PIN'))), const SizedBox(width: 10), Expanded(child: OutlinedButton.icon(onPressed: enabled ? disablePin : null, icon: const Icon(Icons.lock_open_rounded), label: const Text('Disable')))]),
+                  ]),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ShopProfile {
+  String shopName;
+  String ownerName;
+  String phone;
+  String address;
+  String email;
+  String footer;
+
+  ShopProfile({required this.shopName, required this.ownerName, required this.phone, required this.address, required this.email, required this.footer});
+
+  factory ShopProfile.empty() => ShopProfile(shopName: 'Masum Smart Calculator Pro', ownerName: '', phone: '', address: '', email: '', footer: 'Thank you for your business');
+
+  Map<String, dynamic> toJson() => {'shopName': shopName, 'ownerName': ownerName, 'phone': phone, 'address': address, 'email': email, 'footer': footer};
+
+  factory ShopProfile.fromJson(Map<String, dynamic> json) => ShopProfile(
+    shopName: json['shopName'] ?? 'Masum Smart Calculator Pro',
+    ownerName: json['ownerName'] ?? '',
+    phone: json['phone'] ?? '',
+    address: json['address'] ?? '',
+    email: json['email'] ?? '',
+    footer: json['footer'] ?? 'Thank you for your business',
+  );
+}
+
+class CustomerNote {
+  String id;
+  String name;
+  String phone;
+  String address;
+  String note;
+  String tag;
+  double amount;
+  bool important;
+  DateTime dateTime;
+
+  CustomerNote({required this.id, required this.name, required this.phone, required this.address, required this.note, required this.tag, required this.amount, required this.important, required this.dateTime});
+
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'address': address, 'note': note, 'tag': tag, 'amount': amount, 'important': important, 'dateTime': dateTime.toIso8601String()};
+  factory CustomerNote.fromJson(Map<String, dynamic> json) => CustomerNote(id: json['id'] ?? DateTime.now().microsecondsSinceEpoch.toString(), name: json['name'] ?? '', phone: json['phone'] ?? '', address: json['address'] ?? '', note: json['note'] ?? '', tag: json['tag'] ?? 'Customer', amount: (json['amount'] is num ? (json['amount'] as num).toDouble() : double.tryParse('${json['amount']}') ?? 0), important: json['important'] == true, dateTime: DateTime.tryParse(json['dateTime'] ?? '') ?? DateTime.now());
+}
+
+class DuePaymentRecord {
+  String id;
+  String name;
+  String phone;
+  double total;
+  double paid;
+  String note;
+  DateTime dateTime;
+
+  DuePaymentRecord({required this.id, required this.name, required this.phone, required this.total, required this.paid, required this.note, required this.dateTime});
+  double get due => total - paid;
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'total': total, 'paid': paid, 'note': note, 'dateTime': dateTime.toIso8601String()};
+  factory DuePaymentRecord.fromJson(Map<String, dynamic> json) => DuePaymentRecord(id: json['id'] ?? DateTime.now().microsecondsSinceEpoch.toString(), name: json['name'] ?? '', phone: json['phone'] ?? '', total: (json['total'] is num ? (json['total'] as num).toDouble() : double.tryParse('${json['total']}') ?? 0), paid: (json['paid'] is num ? (json['paid'] as num).toDouble() : double.tryParse('${json['paid']}') ?? 0), note: json['note'] ?? '', dateTime: DateTime.tryParse(json['dateTime'] ?? '') ?? DateTime.now());
+}
+
+class CashbookEntry {
+  String id;
+  String title;
+  String type;
+  double amount;
+  String note;
+  DateTime dateTime;
+
+  CashbookEntry({required this.id, required this.title, required this.type, required this.amount, required this.note, required this.dateTime});
+  Map<String, dynamic> toJson() => {'id': id, 'title': title, 'type': type, 'amount': amount, 'note': note, 'dateTime': dateTime.toIso8601String()};
+  factory CashbookEntry.fromJson(Map<String, dynamic> json) => CashbookEntry(id: json['id'] ?? DateTime.now().microsecondsSinceEpoch.toString(), title: json['title'] ?? '', type: json['type'] ?? 'Income', amount: (json['amount'] is num ? (json['amount'] as num).toDouble() : double.tryParse('${json['amount']}') ?? 0), note: json['note'] ?? '', dateTime: DateTime.tryParse(json['dateTime'] ?? '') ?? DateTime.now());
+}
+
+class FollowupReminder {
+  String id;
+  String name;
+  String phone;
+  String note;
+  DateTime reminderDate;
+  bool done;
+
+  FollowupReminder({required this.id, required this.name, required this.phone, required this.note, required this.reminderDate, required this.done});
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'note': note, 'reminderDate': reminderDate.toIso8601String(), 'done': done};
+  factory FollowupReminder.fromJson(Map<String, dynamic> json) => FollowupReminder(id: json['id'] ?? DateTime.now().microsecondsSinceEpoch.toString(), name: json['name'] ?? '', phone: json['phone'] ?? '', note: json['note'] ?? '', reminderDate: DateTime.tryParse(json['reminderDate'] ?? '') ?? DateTime.now(), done: json['done'] == true);
+}
+
+class ReceiptMemo {
+  String id;
+  String name;
+  String phone;
+  String items;
+  double total;
+  double paid;
+  String note;
+  DateTime dateTime;
+
+  ReceiptMemo({required this.id, required this.name, required this.phone, required this.items, required this.total, required this.paid, required this.note, required this.dateTime});
+  double get due => total - paid;
+  Map<String, dynamic> toJson() => {'id': id, 'name': name, 'phone': phone, 'items': items, 'total': total, 'paid': paid, 'note': note, 'dateTime': dateTime.toIso8601String()};
+  factory ReceiptMemo.fromJson(Map<String, dynamic> json) => ReceiptMemo(id: json['id'] ?? DateTime.now().microsecondsSinceEpoch.toString(), name: json['name'] ?? '', phone: json['phone'] ?? '', items: json['items'] ?? '', total: (json['total'] is num ? (json['total'] as num).toDouble() : double.tryParse('${json['total']}') ?? 0), paid: (json['paid'] is num ? (json['paid'] as num).toDouble() : double.tryParse('${json['paid']}') ?? 0), note: json['note'] ?? '', dateTime: DateTime.tryParse(json['dateTime'] ?? '') ?? DateTime.now());
+}
+
+class BusinessNotebookPage extends StatefulWidget {
+  final bool darkMode;
+  const BusinessNotebookPage({super.key, required this.darkMode});
+
+  @override
+  State<BusinessNotebookPage> createState() => _BusinessNotebookPageState();
+}
+
+class _BusinessNotebookPageState extends State<BusinessNotebookPage> {
+  final searchController = TextEditingController();
+  String query = '';
+  List<CustomerNote> customers = [];
+  List<DuePaymentRecord> dues = [];
+  List<CashbookEntry> cashbook = [];
+  List<FollowupReminder> reminders = [];
+  List<ReceiptMemo> receipts = [];
+  ShopProfile shopProfile = ShopProfile.empty();
+  bool busy = false;
+
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
+  Color get card => widget.darkMode ? const Color(0xFF111214) : Colors.white;
+  Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB);
+  Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF111111);
+  Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
+
+  @override
+  void initState() {
+    super.initState();
+    loadAll();
+  }
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
+
+  String id() => DateTime.now().microsecondsSinceEpoch.toString();
+  String money(double v) => v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(2).replaceAll(RegExp(r'0+$'), '').replaceAll(RegExp(r'\.$'), '');
+  String date(DateTime d) => '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
+
+  Future<void> loadAll() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      customers = (prefs.getStringList('customer_notebook') ?? []).map((e) => CustomerNote.fromJson(Map<String, dynamic>.from(jsonDecode(e)))).toList();
+      dues = (prefs.getStringList('due_payment_records') ?? []).map((e) => DuePaymentRecord.fromJson(Map<String, dynamic>.from(jsonDecode(e)))).toList();
+      cashbook = (prefs.getStringList('daily_cashbook_entries') ?? []).map((e) => CashbookEntry.fromJson(Map<String, dynamic>.from(jsonDecode(e)))).toList();
+      reminders = (prefs.getStringList('followup_reminders') ?? []).map((e) => FollowupReminder.fromJson(Map<String, dynamic>.from(jsonDecode(e)))).toList();
+      receipts = (prefs.getStringList('receipt_memos') ?? []).map((e) => ReceiptMemo.fromJson(Map<String, dynamic>.from(jsonDecode(e)))).toList();
+      final profileRaw = prefs.getString('business_profile') ?? '';
+      if (profileRaw.isNotEmpty) shopProfile = ShopProfile.fromJson(Map<String, dynamic>.from(jsonDecode(profileRaw)));
+    });
+  }
+
+  Future<void> saveAll() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList('customer_notebook', customers.map((e) => jsonEncode(e.toJson())).toList());
+    await prefs.setStringList('due_payment_records', dues.map((e) => jsonEncode(e.toJson())).toList());
+    await prefs.setStringList('daily_cashbook_entries', cashbook.map((e) => jsonEncode(e.toJson())).toList());
+    await prefs.setStringList('followup_reminders', reminders.map((e) => jsonEncode(e.toJson())).toList());
+    await prefs.setStringList('receipt_memos', receipts.map((e) => jsonEncode(e.toJson())).toList());
+    await prefs.setString('business_profile', jsonEncode(shopProfile.toJson()));
+    AuthBackupService.scheduleAutoBackup();
+  }
+
+  bool has(String value) => value.toLowerCase().contains(query.toLowerCase());
+  List<CustomerNote> get filteredCustomers => customers.where((e) => query.isEmpty || has('${e.name} ${e.phone} ${e.address} ${e.note} ${e.tag}')).toList();
+  List<DuePaymentRecord> get filteredDues => dues.where((e) => query.isEmpty || has('${e.name} ${e.phone} ${e.note}')).toList();
+  List<CashbookEntry> get filteredCashbook => cashbook.where((e) => query.isEmpty || has('${e.title} ${e.type} ${e.note} ${date(e.dateTime)}')).toList();
+  List<FollowupReminder> get filteredReminders => reminders.where((e) => query.isEmpty || has('${e.name} ${e.phone} ${e.note} ${date(e.reminderDate)}')).toList();
+  List<ReceiptMemo> get filteredReceipts => receipts.where((e) => query.isEmpty || has('${e.name} ${e.phone} ${e.items} ${e.note}')).toList();
+
+  InputDecoration fieldDecoration(String label, IconData icon) => InputDecoration(labelText: label, prefixIcon: Icon(icon, color: Colors.orangeAccent), filled: true, fillColor: widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none));
+
+  void editShopProfileDialog() {
+    final shopName = TextEditingController(text: shopProfile.shopName);
+    final ownerName = TextEditingController(text: shopProfile.ownerName);
+    final phone = TextEditingController(text: shopProfile.phone);
+    final address = TextEditingController(text: shopProfile.address);
+    final email = TextEditingController(text: shopProfile.email);
+    final footer = TextEditingController(text: shopProfile.footer);
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: card2,
+        title: const Text('Shop / Business Profile'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: shopName, decoration: fieldDecoration('Shop / Business Name', Icons.storefront_rounded)),
+              const SizedBox(height: 10),
+              TextField(controller: ownerName, decoration: fieldDecoration('Owner Name', Icons.person_rounded)),
+              const SizedBox(height: 10),
+              TextField(controller: phone, keyboardType: TextInputType.phone, decoration: fieldDecoration('Shop Phone', Icons.phone_rounded)),
+              const SizedBox(height: 10),
+              TextField(controller: address, maxLines: 2, decoration: fieldDecoration('Shop Address', Icons.location_on_rounded)),
+              const SizedBox(height: 10),
+              TextField(controller: email, keyboardType: TextInputType.emailAddress, decoration: fieldDecoration('Email optional', Icons.email_rounded)),
+              const SizedBox(height: 10),
+              TextField(controller: footer, maxLines: 2, decoration: fieldDecoration('Footer Message', Icons.favorite_rounded)),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () {
+              setState(() {
+                shopProfile = ShopProfile(
+                  shopName: shopName.text.trim().isEmpty ? 'Masum Smart Calculator Pro' : shopName.text.trim(),
+                  ownerName: ownerName.text.trim(),
+                  phone: phone.text.trim(),
+                  address: address.text.trim(),
+                  email: email.text.trim(),
+                  footer: footer.text.trim().isEmpty ? 'Thank you for your business' : footer.text.trim(),
+                );
+              });
+              saveAll();
+              Navigator.pop(context);
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Shop profile saved')));
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget searchBox() => Padding(
+        padding: const EdgeInsets.fromLTRB(14, 10, 14, 8),
+        child: TextField(
+          controller: searchController,
+          onChanged: (v) => setState(() => query = v.trim()),
+          style: TextStyle(color: mainText, fontWeight: FontWeight.w700),
+          decoration: fieldDecoration('Search name, phone, date, amount', Icons.search_rounded).copyWith(suffixIcon: query.isEmpty ? null : IconButton(icon: const Icon(Icons.close_rounded), onPressed: () { searchController.clear(); setState(() => query = ''); })),
+        ),
+      );
+
+  Widget emptyText(String text) => Center(child: Padding(padding: const EdgeInsets.all(22), child: Text(text, textAlign: TextAlign.center, style: TextStyle(color: mutedText, fontWeight: FontWeight.w800))));
+
+  Widget premiumCard({required Widget child}) => Container(margin: const EdgeInsets.fromLTRB(14, 0, 14, 12), padding: const EdgeInsets.all(14), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8F2FB)], begin: Alignment.topLeft, end: Alignment.bottomRight), borderRadius: BorderRadius.circular(24), border: Border.all(color: widget.darkMode ? Colors.white12 : Colors.black12)), child: child);
+
+  Future<DateTime?> pickDate(DateTime initial) => showDatePicker(context: context, initialDate: initial, firstDate: DateTime(2020), lastDate: DateTime(2100));
+
+  Future<void> exportBusinessPdf(String title, String body, String fileName) async {
+    if (busy) return;
+    setState(() => busy = true);
+    try {
+      await exportTextPdf(context, title: title, text: body, fileName: fileName);
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  String customerReportText(List<CustomerNote> list, String title) {
+    final b = StringBuffer()..writeln(title)..writeln('Total Records: ${list.length}')..writeln('');
+    for (final e in list) {
+      b..writeln('Name: ${e.name}')..writeln('Phone: ${e.phone}')..writeln('Address: ${e.address}')..writeln('Tag: ${e.tag}')..writeln('Amount/Due: ${money(e.amount)}')..writeln('Important: ${e.important ? 'Yes' : 'No'}')..writeln('Note: ${e.note}')..writeln('Date: ${date(e.dateTime)}')..writeln('------------------------------');
+    }
+    return b.toString();
+  }
+
+  String dueReportText(List<DuePaymentRecord> list, String title) {
+    final total = list.fold<double>(0, (p, e) => p + e.total);
+    final paid = list.fold<double>(0, (p, e) => p + e.paid);
+    final b = StringBuffer()..writeln(title)..writeln('Total: ${money(total)}')..writeln('Paid: ${money(paid)}')..writeln('Due: ${money(total - paid)}')..writeln('');
+    for (final e in list) {
+      b..writeln('Customer: ${e.name}')..writeln('Phone: ${e.phone}')..writeln('Total: ${money(e.total)}')..writeln('Paid: ${money(e.paid)}')..writeln('Due: ${money(e.due)}')..writeln('Note: ${e.note}')..writeln('Date: ${date(e.dateTime)}')..writeln('------------------------------');
+    }
+    return b.toString();
+  }
+
+  String cashbookReportText(List<CashbookEntry> list, String title) {
+    final income = list.where((e) => e.type == 'Income').fold<double>(0, (p, e) => p + e.amount);
+    final expense = list.where((e) => e.type == 'Expense').fold<double>(0, (p, e) => p + e.amount);
+    final b = StringBuffer()..writeln(title)..writeln('Income: ${money(income)}')..writeln('Expense: ${money(expense)}')..writeln('Balance: ${money(income - expense)}')..writeln('');
+    for (final e in list) {
+      b..writeln('${e.type}: ${e.title}')..writeln('Amount: ${money(e.amount)}')..writeln('Note: ${e.note}')..writeln('Date: ${date(e.dateTime)}')..writeln('------------------------------');
+    }
+    return b.toString();
+  }
+
+  String receiptText(ReceiptMemo e) {
+    final receiptNo = e.id.length > 8 ? e.id.substring(e.id.length - 8) : e.id;
+    final b = StringBuffer();
+    b.writeln(shopProfile.shopName);
+    if (shopProfile.ownerName.trim().isNotEmpty) b.writeln('Owner: ${shopProfile.ownerName}');
+    if (shopProfile.phone.trim().isNotEmpty) b.writeln('Phone: ${shopProfile.phone}');
+    if (shopProfile.address.trim().isNotEmpty) b.writeln('Address: ${shopProfile.address}');
+    if (shopProfile.email.trim().isNotEmpty) b.writeln('Email: ${shopProfile.email}');
+    b.writeln('');
+    b.writeln('Receipt / Memo');
+    b.writeln('Receipt No: $receiptNo');
+    b.writeln('Date: ${date(e.dateTime)}');
+    b.writeln('');
+    b.writeln('Customer: ${e.name}');
+    b.writeln('Phone: ${e.phone}');
+    b.writeln('');
+    b.writeln('Items / Details:');
+    b.writeln(e.items);
+    b.writeln('');
+    b.writeln('Total: ${money(e.total)}');
+    b.writeln('Paid: ${money(e.paid)}');
+    b.writeln('Due: ${money(e.due)}');
+    if (e.note.trim().isNotEmpty) b.writeln('Note: ${e.note}');
+    b.writeln('');
+    b.writeln('Signature: __________________');
+    b.writeln('');
+    b.writeln(shopProfile.footer.trim().isEmpty ? 'Thank you for your business' : shopProfile.footer.trim());
+    return b.toString();
+  }
+
+  void exportAllCurrentTab(int tabIndex) {
+    if (tabIndex == 0) exportBusinessPdf('Customer Notebook Report', customerReportText(filteredCustomers, 'Customer Notebook Report'), 'masum_customer_notebook.pdf');
+    if (tabIndex == 1) exportBusinessPdf('Due Payment Report', dueReportText(filteredDues, 'Due Payment Report'), 'masum_due_payment_report.pdf');
+    if (tabIndex == 2) exportBusinessPdf('Daily Cashbook Report', cashbookReportText(filteredCashbook, 'Daily Cashbook Report'), 'masum_daily_cashbook_report.pdf');
+    if (tabIndex == 3) {
+      final b = StringBuffer()..writeln('Follow-up Reminders')..writeln('Total: ${filteredReminders.length}')..writeln('');
+      for (final e in filteredReminders) { b..writeln('Name: ${e.name}')..writeln('Phone: ${e.phone}')..writeln('Reminder Date: ${date(e.reminderDate)}')..writeln('Status: ${e.done ? 'Done' : 'Pending'}')..writeln('Note: ${e.note}')..writeln('------------------------------'); }
+      exportBusinessPdf('Follow-up Reminders', b.toString(), 'masum_followup_reminders.pdf');
+    }
+    if (tabIndex == 4) {
+      final b = StringBuffer()..writeln('Receipt / Memo Report')..writeln('Total: ${filteredReceipts.length}')..writeln('');
+      for (final e in filteredReceipts) { b..writeln(receiptText(e))..writeln('------------------------------'); }
+      exportBusinessPdf('Receipt / Memo Report', b.toString(), 'masum_receipt_memo_report.pdf');
+    }
+  }
+
+  void addCustomerDialog({CustomerNote? edit}) {
+    final name = TextEditingController(text: edit?.name ?? '');
+    final phone = TextEditingController(text: edit?.phone ?? '');
+    final address = TextEditingController(text: edit?.address ?? '');
+    final note = TextEditingController(text: edit?.note ?? '');
+    final tag = TextEditingController(text: edit?.tag ?? 'Customer');
+    final amount = TextEditingController(text: edit == null ? '' : money(edit.amount));
+    bool important = edit?.important ?? false;
+    showDialog(context: context, builder: (_) => StatefulBuilder(builder: (context, setLocal) => AlertDialog(backgroundColor: card2, title: Text(edit == null ? 'Add Customer Note' : 'Edit Customer Note'), content: SingleChildScrollView(child: Column(children: [TextField(controller: name, decoration: fieldDecoration('Name', Icons.person_rounded)), const SizedBox(height: 10), TextField(controller: phone, keyboardType: TextInputType.phone, decoration: fieldDecoration('Phone Number', Icons.phone_rounded)), const SizedBox(height: 10), TextField(controller: address, maxLines: 2, decoration: fieldDecoration('Address', Icons.location_on_rounded)), const SizedBox(height: 10), TextField(controller: amount, keyboardType: TextInputType.number, decoration: fieldDecoration('Amount / Due', Icons.payments_rounded)), const SizedBox(height: 10), TextField(controller: tag, decoration: fieldDecoration('Tag: Customer / Supplier / Personal', Icons.sell_rounded)), const SizedBox(height: 10), TextField(controller: note, maxLines: 3, decoration: fieldDecoration('Important Note', Icons.note_alt_rounded)), SwitchListTile(value: important, onChanged: (v) => setLocal(() => important = v), title: const Text('Mark Important'))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: () { final item = CustomerNote(id: edit?.id ?? id(), name: name.text.trim().isEmpty ? 'No Name' : name.text.trim(), phone: phone.text.trim(), address: address.text.trim(), note: note.text.trim(), tag: tag.text.trim().isEmpty ? 'Customer' : tag.text.trim(), amount: double.tryParse(amount.text.trim()) ?? 0, important: important, dateTime: edit?.dateTime ?? DateTime.now()); setState(() { if (edit == null) { customers.insert(0, item); } else { final i = customers.indexWhere((e) => e.id == edit.id); if (i >= 0) customers[i] = item; } }); saveAll(); Navigator.pop(context); }, child: const Text('Save'))])));
+  }
+
+  void addDueDialog({DuePaymentRecord? edit}) {
+    final name = TextEditingController(text: edit?.name ?? '');
+    final phone = TextEditingController(text: edit?.phone ?? '');
+    final total = TextEditingController(text: edit == null ? '' : money(edit.total));
+    final paid = TextEditingController(text: edit == null ? '' : money(edit.paid));
+    final note = TextEditingController(text: edit?.note ?? '');
+    showDialog(context: context, builder: (_) => AlertDialog(backgroundColor: card2, title: Text(edit == null ? 'Add Due / Payment' : 'Edit Due / Payment'), content: SingleChildScrollView(child: Column(children: [TextField(controller: name, decoration: fieldDecoration('Customer Name', Icons.person_rounded)), const SizedBox(height: 10), TextField(controller: phone, keyboardType: TextInputType.phone, decoration: fieldDecoration('Phone', Icons.phone_rounded)), const SizedBox(height: 10), TextField(controller: total, keyboardType: TextInputType.number, decoration: fieldDecoration('Total Amount', Icons.payments_rounded)), const SizedBox(height: 10), TextField(controller: paid, keyboardType: TextInputType.number, decoration: fieldDecoration('Paid Amount', Icons.savings_rounded)), const SizedBox(height: 10), TextField(controller: note, maxLines: 3, decoration: fieldDecoration('Note', Icons.note_rounded))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: () { final item = DuePaymentRecord(id: edit?.id ?? id(), name: name.text.trim().isEmpty ? 'No Name' : name.text.trim(), phone: phone.text.trim(), total: double.tryParse(total.text.trim()) ?? 0, paid: double.tryParse(paid.text.trim()) ?? 0, note: note.text.trim(), dateTime: edit?.dateTime ?? DateTime.now()); setState(() { if (edit == null) { dues.insert(0, item); } else { final i = dues.indexWhere((e) => e.id == edit.id); if (i >= 0) dues[i] = item; } }); saveAll(); Navigator.pop(context); }, child: const Text('Save'))]));
+  }
+
+  void addCashDialog({CashbookEntry? edit}) {
+    final title = TextEditingController(text: edit?.title ?? '');
+    final amount = TextEditingController(text: edit == null ? '' : money(edit.amount));
+    final note = TextEditingController(text: edit?.note ?? '');
+    String type = edit?.type ?? 'Income';
+    showDialog(context: context, builder: (_) => StatefulBuilder(builder: (context, setLocal) => AlertDialog(backgroundColor: card2, title: Text(edit == null ? 'Add Cashbook Entry' : 'Edit Cashbook Entry'), content: SingleChildScrollView(child: Column(children: [DropdownButtonFormField<String>(value: type, items: const [DropdownMenuItem(value: 'Income', child: Text('Income')), DropdownMenuItem(value: 'Expense', child: Text('Expense'))], onChanged: (v) => setLocal(() => type = v ?? 'Income'), decoration: fieldDecoration('Type', Icons.swap_vert_rounded)), const SizedBox(height: 10), TextField(controller: title, decoration: fieldDecoration('Title', Icons.title_rounded)), const SizedBox(height: 10), TextField(controller: amount, keyboardType: TextInputType.number, decoration: fieldDecoration('Amount', Icons.payments_rounded)), const SizedBox(height: 10), TextField(controller: note, maxLines: 3, decoration: fieldDecoration('Note', Icons.note_rounded))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: () { final item = CashbookEntry(id: edit?.id ?? id(), title: title.text.trim().isEmpty ? type : title.text.trim(), type: type, amount: double.tryParse(amount.text.trim()) ?? 0, note: note.text.trim(), dateTime: edit?.dateTime ?? DateTime.now()); setState(() { if (edit == null) { cashbook.insert(0, item); } else { final i = cashbook.indexWhere((e) => e.id == edit.id); if (i >= 0) cashbook[i] = item; } }); saveAll(); Navigator.pop(context); }, child: const Text('Save'))])));
+  }
+
+  void addReminderDialog({FollowupReminder? edit}) {
+    final name = TextEditingController(text: edit?.name ?? '');
+    final phone = TextEditingController(text: edit?.phone ?? '');
+    final note = TextEditingController(text: edit?.note ?? '');
+    DateTime picked = edit?.reminderDate ?? DateTime.now().add(const Duration(days: 1));
+    showDialog(context: context, builder: (_) => StatefulBuilder(builder: (context, setLocal) => AlertDialog(backgroundColor: card2, title: Text(edit == null ? 'Add Reminder' : 'Edit Reminder'), content: SingleChildScrollView(child: Column(children: [TextField(controller: name, decoration: fieldDecoration('Person Name', Icons.person_rounded)), const SizedBox(height: 10), TextField(controller: phone, keyboardType: TextInputType.phone, decoration: fieldDecoration('Phone', Icons.phone_rounded)), const SizedBox(height: 10), ListTile(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)), tileColor: widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF4F7FB), leading: const Icon(Icons.calendar_month_rounded, color: Colors.orangeAccent), title: Text('Reminder Date: ${date(picked)}', style: TextStyle(color: mainText, fontWeight: FontWeight.w800)), onTap: () async { final d = await pickDate(picked); if (d != null) setLocal(() => picked = d); }), const SizedBox(height: 10), TextField(controller: note, maxLines: 3, decoration: fieldDecoration('Note', Icons.note_rounded))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: () { final item = FollowupReminder(id: edit?.id ?? id(), name: name.text.trim().isEmpty ? 'No Name' : name.text.trim(), phone: phone.text.trim(), note: note.text.trim(), reminderDate: picked, done: edit?.done ?? false); setState(() { if (edit == null) { reminders.insert(0, item); } else { final i = reminders.indexWhere((e) => e.id == edit.id); if (i >= 0) reminders[i] = item; } }); saveAll(); Navigator.pop(context); }, child: const Text('Save'))])));
+  }
+
+  void addReceiptDialog({ReceiptMemo? edit}) {
+    final name = TextEditingController(text: edit?.name ?? '');
+    final phone = TextEditingController(text: edit?.phone ?? '');
+    final items = TextEditingController(text: edit?.items ?? '');
+    final total = TextEditingController(text: edit == null ? '' : money(edit.total));
+    final paid = TextEditingController(text: edit == null ? '' : money(edit.paid));
+    final note = TextEditingController(text: edit?.note ?? '');
+    showDialog(context: context, builder: (_) => AlertDialog(backgroundColor: card2, title: Text(edit == null ? 'Create Receipt / Memo' : 'Edit Receipt / Memo'), content: SingleChildScrollView(child: Column(children: [TextField(controller: name, decoration: fieldDecoration('Customer Name', Icons.person_rounded)), const SizedBox(height: 10), TextField(controller: phone, keyboardType: TextInputType.phone, decoration: fieldDecoration('Phone', Icons.phone_rounded)), const SizedBox(height: 10), TextField(controller: items, maxLines: 4, decoration: fieldDecoration('Items / Details', Icons.receipt_long_rounded)), const SizedBox(height: 10), TextField(controller: total, keyboardType: TextInputType.number, decoration: fieldDecoration('Total', Icons.payments_rounded)), const SizedBox(height: 10), TextField(controller: paid, keyboardType: TextInputType.number, decoration: fieldDecoration('Paid', Icons.savings_rounded)), const SizedBox(height: 10), TextField(controller: note, maxLines: 2, decoration: fieldDecoration('Note', Icons.note_rounded))])), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), ElevatedButton(onPressed: () { final item = ReceiptMemo(id: edit?.id ?? id(), name: name.text.trim().isEmpty ? 'No Name' : name.text.trim(), phone: phone.text.trim(), items: items.text.trim(), total: double.tryParse(total.text.trim()) ?? 0, paid: double.tryParse(paid.text.trim()) ?? 0, note: note.text.trim(), dateTime: edit?.dateTime ?? DateTime.now()); setState(() { if (edit == null) { receipts.insert(0, item); } else { final i = receipts.indexWhere((e) => e.id == edit.id); if (i >= 0) receipts[i] = item; } }); saveAll(); Navigator.pop(context); }, child: const Text('Save'))]));
+  }
+
+  Widget actionIcon(IconData icon, Color color, VoidCallback onTap) => IconButton(onPressed: onTap, icon: Icon(icon, color: color));
+
+  Widget customerList() {
+    final list = filteredCustomers;
+    if (list.isEmpty) return emptyText('No customer notes yet');
+    return ListView(children: list.map((e) => premiumCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [Icon(e.important ? Icons.star_rounded : Icons.person_rounded, color: e.important ? Colors.amber : Colors.orangeAccent), const SizedBox(width: 10), Expanded(child: Text(e.name, style: TextStyle(color: mainText, fontSize: 18, fontWeight: FontWeight.w900))), Text(e.tag, style: TextStyle(color: mutedText, fontWeight: FontWeight.bold))]), const SizedBox(height: 8), Text('Phone: ${e.phone}\nAddress: ${e.address}\nAmount/Due: ${money(e.amount)}\nNote: ${e.note}\nDate: ${date(e.dateTime)}', style: TextStyle(color: mutedText, height: 1.45, fontWeight: FontWeight.w600)), Row(mainAxisAlignment: MainAxisAlignment.end, children: [actionIcon(Icons.picture_as_pdf_rounded, Colors.orangeAccent, () => exportBusinessPdf('${e.name} Customer Note', customerReportText([e], '${e.name} Customer Note'), safePdfFileName('${e.name}_customer_note'))), actionIcon(Icons.edit_rounded, Colors.cyanAccent, () => addCustomerDialog(edit: e)), actionIcon(Icons.delete_rounded, Colors.redAccent, () { setState(() => customers.removeWhere((x) => x.id == e.id)); saveAll(); })])]))).toList());
+  }
+
+  Widget dueList() {
+    final list = filteredDues;
+    if (list.isEmpty) return emptyText('No due/payment records yet');
+    return ListView(children: list.map((e) => premiumCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [const Icon(Icons.account_balance_wallet_rounded, color: Colors.greenAccent), const SizedBox(width: 10), Expanded(child: Text(e.name, style: TextStyle(color: mainText, fontSize: 18, fontWeight: FontWeight.w900))), Text('Due ${money(e.due)}', style: TextStyle(color: e.due > 0 ? Colors.orangeAccent : Colors.greenAccent, fontWeight: FontWeight.w900))]), const SizedBox(height: 8), Text('Phone: ${e.phone}\nTotal: ${money(e.total)} | Paid: ${money(e.paid)} | Due: ${money(e.due)}\nNote: ${e.note}\nDate: ${date(e.dateTime)}', style: TextStyle(color: mutedText, height: 1.45, fontWeight: FontWeight.w600)), Row(mainAxisAlignment: MainAxisAlignment.end, children: [actionIcon(Icons.receipt_long_rounded, Colors.orangeAccent, () => exportBusinessPdf('${e.name} Due Receipt', dueReportText([e], '${e.name} Due Receipt'), safePdfFileName('${e.name}_due_receipt'))), actionIcon(Icons.edit_rounded, Colors.cyanAccent, () => addDueDialog(edit: e)), actionIcon(Icons.delete_rounded, Colors.redAccent, () { setState(() => dues.removeWhere((x) => x.id == e.id)); saveAll(); })])]))).toList());
+  }
+
+  Widget cashbookList() {
+    final list = filteredCashbook;
+    if (list.isEmpty) return emptyText('No cashbook entry yet');
+    return ListView(children: list.map((e) => premiumCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [Icon(e.type == 'Income' ? Icons.arrow_downward_rounded : Icons.arrow_upward_rounded, color: e.type == 'Income' ? Colors.greenAccent : Colors.redAccent), const SizedBox(width: 10), Expanded(child: Text(e.title, style: TextStyle(color: mainText, fontSize: 18, fontWeight: FontWeight.w900))), Text('${e.type}: ${money(e.amount)}', style: TextStyle(color: e.type == 'Income' ? Colors.greenAccent : Colors.redAccent, fontWeight: FontWeight.w900))]), const SizedBox(height: 8), Text('Note: ${e.note}\nDate: ${date(e.dateTime)}', style: TextStyle(color: mutedText, height: 1.45, fontWeight: FontWeight.w600)), Row(mainAxisAlignment: MainAxisAlignment.end, children: [actionIcon(Icons.edit_rounded, Colors.cyanAccent, () => addCashDialog(edit: e)), actionIcon(Icons.delete_rounded, Colors.redAccent, () { setState(() => cashbook.removeWhere((x) => x.id == e.id)); saveAll(); })])]))).toList());
+  }
+
+  Widget reminderList() {
+    final list = filteredReminders;
+    if (list.isEmpty) return emptyText('No reminder yet');
+    return ListView(children: list.map((e) => premiumCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [Icon(e.done ? Icons.check_circle_rounded : Icons.notifications_active_rounded, color: e.done ? Colors.greenAccent : Colors.orangeAccent), const SizedBox(width: 10), Expanded(child: Text(e.name, style: TextStyle(color: mainText, fontSize: 18, fontWeight: FontWeight.w900))), Text(date(e.reminderDate), style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.w900))]), const SizedBox(height: 8), Text('Phone: ${e.phone}\nNote: ${e.note}\nStatus: ${e.done ? 'Done' : 'Pending'}', style: TextStyle(color: mutedText, height: 1.45, fontWeight: FontWeight.w600)), Row(mainAxisAlignment: MainAxisAlignment.end, children: [actionIcon(e.done ? Icons.undo_rounded : Icons.done_rounded, Colors.greenAccent, () { setState(() => e.done = !e.done); saveAll(); }), actionIcon(Icons.edit_rounded, Colors.cyanAccent, () => addReminderDialog(edit: e)), actionIcon(Icons.delete_rounded, Colors.redAccent, () { setState(() => reminders.removeWhere((x) => x.id == e.id)); saveAll(); })])]))).toList());
+  }
+
+  Widget receiptList() {
+    final list = filteredReceipts;
+    if (list.isEmpty) return emptyText('No receipt/memo yet');
+    return ListView(children: list.map((e) => premiumCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [const Icon(Icons.receipt_long_rounded, color: Colors.orangeAccent), const SizedBox(width: 10), Expanded(child: Text(e.name, style: TextStyle(color: mainText, fontSize: 18, fontWeight: FontWeight.w900))), Text('Due ${money(e.due)}', style: TextStyle(color: e.due > 0 ? Colors.orangeAccent : Colors.greenAccent, fontWeight: FontWeight.w900))]), const SizedBox(height: 8), Text('Phone: ${e.phone}\nItems: ${e.items}\nTotal: ${money(e.total)} | Paid: ${money(e.paid)} | Due: ${money(e.due)}\nDate: ${date(e.dateTime)}', style: TextStyle(color: mutedText, height: 1.45, fontWeight: FontWeight.w600)), Row(mainAxisAlignment: MainAxisAlignment.end, children: [actionIcon(Icons.picture_as_pdf_rounded, Colors.orangeAccent, () => exportBusinessPdf('${e.name} Receipt Memo', receiptText(e), safePdfFileName('${e.name}_receipt_memo'))), actionIcon(Icons.edit_rounded, Colors.cyanAccent, () => addReceiptDialog(edit: e)), actionIcon(Icons.delete_rounded, Colors.redAccent, () { setState(() => receipts.removeWhere((x) => x.id == e.id)); saveAll(); })])]))).toList());
+  }
+
+  void addForTab(int tab) {
+    if (tab == 0) addCustomerDialog();
+    if (tab == 1) addDueDialog();
+    if (tab == 2) addCashDialog();
+    if (tab == 3) addReminderDialog();
+    if (tab == 4) addReceiptDialog();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity;
+    return DefaultTabController(
+      length: 5,
+      child: Builder(builder: (context) {
+        final tabController = DefaultTabController.of(context);
+        return Scaffold(
+          backgroundColor: bg,
+          appBar: AppBar(
+            backgroundColor: bg,
+            iconTheme: IconThemeData(color: mainText),
+            title: Text('Business Notebook', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)),
+            actions: [
+              if (busy) const Padding(padding: EdgeInsets.only(right: 10), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))),
+              IconButton(onPressed: editShopProfileDialog, tooltip: 'Shop Profile', icon: const Icon(Icons.storefront_rounded, color: Colors.cyanAccent)),
+              IconButton(onPressed: () => exportAllCurrentTab(tabController.index), icon: const Icon(Icons.picture_as_pdf_rounded, color: Colors.orangeAccent)),
+              IconButton(onPressed: () => addForTab(tabController.index), icon: const Icon(Icons.add_circle_rounded, color: Colors.greenAccent)),
+            ],
+            bottom: TabBar(
+              isScrollable: true,
+              labelColor: Colors.orangeAccent,
+              unselectedLabelColor: mutedText,
+              indicatorColor: Colors.orangeAccent,
+              tabs: const [Tab(text: 'Notes'), Tab(text: 'Dues'), Tab(text: 'Cashbook'), Tab(text: 'Reminder'), Tab(text: 'Receipt')],
+            ),
+          ),
+          floatingActionButton: FloatingActionButton.extended(backgroundColor: const Color(0xFFFF9500), onPressed: () => addForTab(tabController.index), icon: const Icon(Icons.add_rounded), label: const Text('Add')),
+          body: Center(
+            child: Container(
+              width: maxWidth,
+              decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF050505), const Color(0xFF000000)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)),
+              child: Column(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 10, 14, 0),
+                    child: InkWell(
+                      onTap: editShopProfileDialog,
+                      borderRadius: BorderRadius.circular(20),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(20), border: Border.all(color: widget.darkMode ? Colors.white12 : Colors.black12)),
+                        child: Row(children: [const Icon(Icons.storefront_rounded, color: Colors.orangeAccent), const SizedBox(width: 10), Expanded(child: Text(shopProfile.shopName, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: mainText, fontWeight: FontWeight.w900))), Text('Edit', style: TextStyle(color: mutedText, fontWeight: FontWeight.w800))]),
+                      ),
+                    ),
+                  ),
+                  searchBox(),
+                  Expanded(child: TabBarView(children: [customerList(), dueList(), cashbookList(), reminderList(), receiptList()])),
+                ],
+              ),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+}
+
 class UnitConverterPage extends StatefulWidget { final bool darkMode; const UnitConverterPage({super.key, required this.darkMode}); @override State<UnitConverterPage> createState() => _UnitConverterPageState(); }
 class _UnitConverterPageState extends State<UnitConverterPage> {
   String category = 'Length', fromUnit = 'Meter', toUnit = 'Kilometer', result = '0'; final valueController = TextEditingController();
   final units = {'Length': ['Meter', 'Kilometer', 'Centimeter', 'Millimeter', 'Inch', 'Foot'], 'Weight': ['Kilogram', 'Gram', 'Pound', 'Ounce'], 'Temperature': ['Celsius', 'Fahrenheit', 'Kelvin']};
-  Color get bg => widget.darkMode ? const Color(0xFF050B16) : const Color(0xFFF4F7FB); Color get card => widget.darkMode ? const Color(0xFF0E1B2C) : Colors.white; Color get card2 => widget.darkMode ? const Color(0xFF132A42) : const Color(0xFFE8F2FB); Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF071323); Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
+  Color get bg => widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB); Color get card => widget.darkMode ? const Color(0xFF111214) : Colors.white; Color get card2 => widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFE8F2FB); Color get mainText => widget.darkMode ? Colors.white : const Color(0xFF151517); Color get mutedText => widget.darkMode ? Colors.white60 : const Color(0xFF526070);
   @override void dispose() { valueController.dispose(); super.dispose(); }
   void changeCategory(String c) { setState(() { category = c; fromUnit = units[category]![0]; toUnit = units[category]![1]; calculate(); }); }
   double toBase(double v, String u) { if (category == 'Length') { switch (u) { case 'Kilometer': return v * 1000; case 'Centimeter': return v / 100; case 'Millimeter': return v / 1000; case 'Inch': return v * 0.0254; case 'Foot': return v * 0.3048; } } if (category == 'Weight') { switch (u) { case 'Gram': return v / 1000; case 'Pound': return v * 0.45359237; case 'Ounce': return v * 0.028349523125; } } if (category == 'Temperature') { switch (u) { case 'Fahrenheit': return (v - 32) * 5 / 9; case 'Kelvin': return v - 273.15; } } return v; }
@@ -3341,17 +5270,176 @@ class _UnitConverterPageState extends State<UnitConverterPage> {
   void swapUnits() { setState(() { final old = fromUnit; fromUnit = toUnit; toUnit = old; calculate(); }); }
   Widget categoryButton(String text, IconData icon) { final active = category == text; return Expanded(child: Padding(padding: const EdgeInsets.all(4), child: PressScale(borderRadius: BorderRadius.circular(18), onTap: () => changeCategory(text), child: Container(padding: const EdgeInsets.symmetric(vertical: 12), decoration: BoxDecoration(gradient: active ? const LinearGradient(colors: [Color(0xFF22D3EE), Color(0xFF0E9FB3)]) : null, color: active ? null : card, borderRadius: BorderRadius.circular(18)), child: Column(children: [Icon(icon, color: active ? Colors.white : const Color(0xFF22D3EE), size: 22), const SizedBox(height: 5), Text(text, style: TextStyle(color: active ? Colors.white : mainText, fontWeight: FontWeight.bold, fontSize: 12))]))))); }
   Widget unitDropdown(String value, Function(String) onChanged) => Expanded(child: Container(padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4), decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(18), border: Border.all(color: Colors.white.withOpacity(0.08))), child: DropdownButtonHideUnderline(child: DropdownButton<String>(dropdownColor: card, value: value, isExpanded: true, items: units[category]!.map((u) => DropdownMenuItem(value: u, child: Text(u, style: TextStyle(color: mainText, fontWeight: FontWeight.w700)))).toList(), onChanged: (v) { if (v != null) onChanged(v); }))));
-  @override Widget build(BuildContext context) { final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity; return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Unit Converter', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText)), body: Center(child: Container(width: maxWidth, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF06101F), const Color(0xFF020611)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 10, 14, 18), child: Column(children: [Row(children: [categoryButton('Length', Icons.straighten_rounded), categoryButton('Weight', Icons.monitor_weight_rounded), categoryButton('Temperature', Icons.thermostat_rounded)]), const SizedBox(height: 14), Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(24)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Enter value', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 10), TextField(controller: valueController, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true), onChanged: (_) => calculate(), style: TextStyle(color: mainText, fontSize: 24, fontWeight: FontWeight.bold), decoration: InputDecoration(hintText: '0', filled: true, fillColor: widget.darkMode ? const Color(0xFF071323) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: const Icon(Icons.edit_rounded, color: Colors.cyanAccent))), const SizedBox(height: 14), Row(children: [unitDropdown(fromUnit, (v) => setState(() { fromUnit = v; calculate(); })), Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: PressScale(borderRadius: BorderRadius.circular(20), onTap: swapUnits, child: Container(height: 42, width: 42, decoration: BoxDecoration(color: const Color(0xFF7C4DFF), borderRadius: BorderRadius.circular(18)), child: const Icon(Icons.swap_horiz_rounded, color: Colors.white)))), unitDropdown(toUnit, (v) => setState(() { toUnit = v; calculate(); }))])])), const SizedBox(height: 14), Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF173A56), const Color(0xFF0C1C2E)] : [Colors.white, const Color(0xFFE8F2FB)]), borderRadius: BorderRadius.circular(26)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Result', style: TextStyle(color: mutedText)), const SizedBox(height: 8), Row(crossAxisAlignment: CrossAxisAlignment.end, children: [Expanded(child: FittedBox(alignment: Alignment.centerLeft, fit: BoxFit.scaleDown, child: Text(result, style: TextStyle(color: mainText, fontSize: 42, fontWeight: FontWeight.w900)))), const SizedBox(width: 8), Padding(padding: const EdgeInsets.only(bottom: 7), child: Text(toUnit, style: const TextStyle(color: Colors.cyanAccent, fontSize: 15, fontWeight: FontWeight.bold)))])])), const SizedBox(height: 14), Container(width: double.infinity, padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: card2, borderRadius: BorderRadius.circular(20)), child: Text('Example: 1 Kilometer = 1000 Meter, 1 Kg = 1000 Gram', style: TextStyle(color: mutedText)))]))))); }
+  @override Widget build(BuildContext context) { final maxWidth = MediaQuery.of(context).size.width > 700 ? 420.0 : double.infinity; return Scaffold(backgroundColor: bg, appBar: AppBar(backgroundColor: bg, title: Text('Unit Converter', style: TextStyle(color: mainText, fontWeight: FontWeight.w900)), iconTheme: IconThemeData(color: mainText)), body: Center(child: Container(width: maxWidth, decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF050505), const Color(0xFF000000)] : [const Color(0xFFF7FBFF), const Color(0xFFEAF1FA)], begin: Alignment.topCenter, end: Alignment.bottomCenter)), child: SingleChildScrollView(padding: const EdgeInsets.fromLTRB(14, 10, 14, 18), child: Column(children: [Row(children: [categoryButton('Length', Icons.straighten_rounded), categoryButton('Weight', Icons.monitor_weight_rounded), categoryButton('Temperature', Icons.thermostat_rounded)]), const SizedBox(height: 14), Container(padding: const EdgeInsets.all(16), decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(24)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Enter value', style: TextStyle(color: mutedText, fontWeight: FontWeight.bold)), const SizedBox(height: 10), TextField(controller: valueController, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true), onChanged: (_) => calculate(), style: TextStyle(color: mainText, fontSize: 24, fontWeight: FontWeight.bold), decoration: InputDecoration(hintText: '0', filled: true, fillColor: widget.darkMode ? const Color(0xFF151517) : const Color(0xFFF4F7FB), border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none), prefixIcon: const Icon(Icons.edit_rounded, color: Colors.cyanAccent))), const SizedBox(height: 14), Row(children: [unitDropdown(fromUnit, (v) => setState(() { fromUnit = v; calculate(); })), Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: PressScale(borderRadius: BorderRadius.circular(20), onTap: swapUnits, child: Container(height: 42, width: 42, decoration: BoxDecoration(color: const Color(0xFF7C4DFF), borderRadius: BorderRadius.circular(18)), child: const Icon(Icons.swap_horiz_rounded, color: Colors.white)))), unitDropdown(toUnit, (v) => setState(() { toUnit = v; calculate(); }))])])), const SizedBox(height: 14), Container(width: double.infinity, padding: const EdgeInsets.all(18), decoration: BoxDecoration(gradient: LinearGradient(colors: widget.darkMode ? [const Color(0xFF1C1C1E), const Color(0xFF111214)] : [Colors.white, const Color(0xFFE8F2FB)]), borderRadius: BorderRadius.circular(26)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('Result', style: TextStyle(color: mutedText)), const SizedBox(height: 8), Row(crossAxisAlignment: CrossAxisAlignment.end, children: [Expanded(child: FittedBox(alignment: Alignment.centerLeft, fit: BoxFit.scaleDown, child: Text(result, style: TextStyle(color: mainText, fontSize: 42, fontWeight: FontWeight.w900)))), const SizedBox(width: 8), Padding(padding: const EdgeInsets.only(bottom: 7), child: Text(toUnit, style: const TextStyle(color: Colors.cyanAccent, fontSize: 15, fontWeight: FontWeight.bold)))])])), const SizedBox(height: 14), Container(width: double.infinity, padding: const EdgeInsets.all(14), decoration: BoxDecoration(color: card2, borderRadius: BorderRadius.circular(20)), child: Text('Example: 1 Kilometer = 1000 Meter, 1 Kg = 1000 Gram', style: TextStyle(color: mutedText)))]))))); }
+}
+
+double sinh(double x) => (exp(x) - exp(-x)) / 2;
+double cosh(double x) => (exp(x) + exp(-x)) / 2;
+double tanh(double x) {
+  final ex = exp(x);
+  final enx = exp(-x);
+  return (ex - enx) / (ex + enx);
 }
 
 class Parser {
-  final String text; final bool degreeMode; int i = 0; Parser(this.text, {required this.degreeMode});
-  double parse() { final value = parseExpression(); if (i < text.length) throw Exception('Invalid expression'); return value; }
-  double parseExpression() { double value = parseTerm(); while (i < text.length) { if (text[i] == '+') { i++; value += parseTerm(); } else if (text[i] == '-') { i++; value -= parseTerm(); } else { break; } } return value; }
-  double parseTerm() { double value = parsePower(); while (i < text.length) { if (text[i] == '×') { i++; value *= parsePower(); } else if (text[i] == '÷') { i++; value /= parsePower(); } else if (text[i] == '%') { i++; value = value % parsePower(); } else { break; } } return value; }
-  double parsePower() { double value = parseFactor(); while (i < text.length && text[i] == '^') { i++; value = pow(value, parseFactor()).toDouble(); } return value; }
-  double parseFactor() { if (i < text.length && text[i] == '-') { i++; return -parseFactor(); } if (match('sin(')) { final v = parseExpression(); closeParen(); return sin(toAngle(v)); } if (match('cos(')) { final v = parseExpression(); closeParen(); return cos(toAngle(v)); } if (match('tan(')) { final v = parseExpression(); closeParen(); return tan(toAngle(v)); } if (match('log(')) { final v = parseExpression(); closeParen(); return log(v) / ln10; } if (match('ln(')) { final v = parseExpression(); closeParen(); return log(v); } if (i < text.length && text[i] == '(') { i++; final value = parseExpression(); closeParen(); if (i < text.length && text[i] == '!') { i++; return factorial(value); } return value; } if (i < text.length && text[i] == '√') { i++; if (i < text.length && text[i] == '(') { i++; final value = parseExpression(); closeParen(); return sqrt(value); } } double value = parseNumber(); if (i < text.length && text[i] == '!') { i++; value = factorial(value); } return value; }
-  double toAngle(double v) => degreeMode ? v * pi / 180 : v; bool match(String s) { if (text.substring(i).startsWith(s)) { i += s.length; return true; } return false; } void closeParen() { if (i < text.length && text[i] == ')') i++; } double factorial(double v) { final n = v.round(); if (n < 0 || n > 170) throw Exception('Invalid factorial'); double r = 1; for (int x = 2; x <= n; x++) { r *= x; } return r; } double parseNumber() { final start = i; while (i < text.length && RegExp(r'[0-9.]').hasMatch(text[i])) { i++; } if (start == i) throw Exception('Invalid number'); return double.parse(text.substring(start, i)); }
+  final String text;
+  final bool degreeMode;
+  int i = 0;
+
+  Parser(this.text, {required this.degreeMode});
+
+  double parse() {
+    final value = parseExpression();
+    if (i < text.length) throw Exception('Invalid expression');
+    return value;
+  }
+
+  double parseExpression() {
+    double value = parseTerm();
+    while (i < text.length) {
+      if (text[i] == '+') {
+        i++;
+        value += parseTerm();
+      } else if (text[i] == '-') {
+        i++;
+        value -= parseTerm();
+      } else {
+        break;
+      }
+    }
+    return value;
+  }
+
+  double parseTerm() {
+    double value = parsePower();
+    while (i < text.length) {
+      if (text[i] == '×') {
+        i++;
+        value *= parsePower();
+      } else if (text[i] == '÷') {
+        i++;
+        value /= parsePower();
+      } else {
+        break;
+      }
+    }
+    return value;
+  }
+
+  double parsePower() {
+    double value = parseFactor();
+    while (i < text.length && text[i] == '^') {
+      i++;
+      value = pow(value, parseFactor()).toDouble();
+    }
+    return value;
+  }
+
+  double parseFactor() {
+    if (i < text.length && text[i] == '-') {
+      i++;
+      return -parseFactor();
+    }
+
+    double value;
+
+    if (match('sinh(')) {
+      final v = parseExpression();
+      closeParen();
+      value = sinh(v);
+    } else if (match('cosh(')) {
+      final v = parseExpression();
+      closeParen();
+      value = cosh(v);
+    } else if (match('tanh(')) {
+      final v = parseExpression();
+      closeParen();
+      value = tanh(v);
+    } else if (match('sin(')) {
+      final v = parseExpression();
+      closeParen();
+      value = sin(toAngle(v));
+    } else if (match('cos(')) {
+      final v = parseExpression();
+      closeParen();
+      value = cos(toAngle(v));
+    } else if (match('tan(')) {
+      final v = parseExpression();
+      closeParen();
+      value = tan(toAngle(v));
+    } else if (match('log(')) {
+      final v = parseExpression();
+      closeParen();
+      value = log(v) / ln10;
+    } else if (match('ln(')) {
+      final v = parseExpression();
+      closeParen();
+      value = log(v);
+    } else if (i < text.length && text[i] == '(') {
+      i++;
+      value = parseExpression();
+      closeParen();
+    } else if (i < text.length && text[i] == '√') {
+      i++;
+      if (i < text.length && text[i] == '(') {
+        i++;
+        value = parseExpression();
+        closeParen();
+        value = sqrt(value);
+      } else {
+        value = sqrt(parseFactor());
+      }
+    } else {
+      value = parseNumber();
+    }
+
+    while (i < text.length) {
+      if (text[i] == '!') {
+        i++;
+        value = factorial(value);
+      } else if (text[i] == '%') {
+        i++;
+        value = value / 100;
+      } else {
+        break;
+      }
+    }
+
+    return value;
+  }
+
+  double toAngle(double v) => degreeMode ? v * pi / 180 : v;
+
+  bool match(String s) {
+    if (text.substring(i).startsWith(s)) {
+      i += s.length;
+      return true;
+    }
+    return false;
+  }
+
+  void closeParen() {
+    if (i < text.length && text[i] == ')') i++;
+  }
+
+  double factorial(double v) {
+    final n = v.round();
+    if (n < 0 || n > 170 || v != n) throw Exception('Invalid factorial');
+    double r = 1;
+    for (int x = 2; x <= n; x++) {
+      r *= x;
+    }
+    return r;
+  }
+
+  double parseNumber() {
+    final start = i;
+    while (i < text.length && RegExp(r'[0-9.]').hasMatch(text[i])) {
+      i++;
+    }
+    if (start == i) throw Exception('Invalid number');
+    return double.parse(text.substring(start, i));
+  }
 }
 
 String numberToEnglishWords(int number) {
@@ -3364,8 +5452,135 @@ String numberToEnglishWords(int number) {
 
 String numberToBanglaWords(int number) {
   if (number == 0) return 'শূন্য';
-  final ones = ['', 'এক', 'দুই', 'তিন', 'চার', 'পাঁচ', 'ছয়', 'সাত', 'আট', 'নয়', 'দশ', 'এগারো', 'বারো', 'তেরো', 'চৌদ্দ', 'পনেরো', 'ষোল', 'সতেরো', 'আঠারো', 'উনিশ'];
-  final tens = ['', '', 'বিশ', 'ত্রিশ', 'চল্লিশ', 'পঞ্চাশ', 'ষাট', 'সত্তর', 'আশি', 'নব্বই'];
-  String small(int n) { String w = ''; if (n >= 100) { w += '${ones[n ~/ 100]} শত '; n %= 100; } if (n >= 20) { w += '${tens[n ~/ 10]} '; n %= 10; } if (n > 0) w += '${ones[n]} '; return w.trim(); }
-  String words = ''; if (number >= 10000000) { words += '${small(number ~/ 10000000)} কোটি '; number %= 10000000; } if (number >= 100000) { words += '${small(number ~/ 100000)} লাখ '; number %= 100000; } if (number >= 1000) { words += '${small(number ~/ 1000)} হাজার '; number %= 1000; } if (number > 0) words += small(number); return words.trim();
+
+  const banglaNumbers = <int, String>{
+    0: 'শূন্য',
+    1: 'এক',
+    2: 'দুই',
+    3: 'তিন',
+    4: 'চার',
+    5: 'পাঁচ',
+    6: 'ছয়',
+    7: 'সাত',
+    8: 'আট',
+    9: 'নয়',
+    10: 'দশ',
+    11: 'এগারো',
+    12: 'বারো',
+    13: 'তেরো',
+    14: 'চৌদ্দ',
+    15: 'পনেরো',
+    16: 'ষোল',
+    17: 'সতেরো',
+    18: 'আঠারো',
+    19: 'উনিশ',
+    20: 'বিশ',
+    21: 'একুশ',
+    22: 'বাইশ',
+    23: 'তেইশ',
+    24: 'চব্বিশ',
+    25: 'পঁচিশ',
+    26: 'ছাব্বিশ',
+    27: 'সাতাশ',
+    28: 'আটাশ',
+    29: 'ঊনত্রিশ',
+    30: 'ত্রিশ',
+    31: 'একত্রিশ',
+    32: 'বত্রিশ',
+    33: 'তেত্রিশ',
+    34: 'চৌত্রিশ',
+    35: 'পঁয়ত্রিশ',
+    36: 'ছত্রিশ',
+    37: 'সাঁইত্রিশ',
+    38: 'আটত্রিশ',
+    39: 'ঊনচল্লিশ',
+    40: 'চল্লিশ',
+    41: 'একচল্লিশ',
+    42: 'বিয়াল্লিশ',
+    43: 'তেতাল্লিশ',
+    44: 'চুয়াল্লিশ',
+    45: 'পঁয়তাল্লিশ',
+    46: 'ছেচল্লিশ',
+    47: 'সাতচল্লিশ',
+    48: 'আটচল্লিশ',
+    49: 'ঊনপঞ্চাশ',
+    50: 'পঞ্চাশ',
+    51: 'একান্ন',
+    52: 'বাহান্ন',
+    53: 'তেপ্পান্ন',
+    54: 'চুয়ান্ন',
+    55: 'পঞ্চান্ন',
+    56: 'ছাপ্পান্ন',
+    57: 'সাতান্ন',
+    58: 'আটান্ন',
+    59: 'ঊনষাট',
+    60: 'ষাট',
+    61: 'একষট্টি',
+    62: 'বাষট্টি',
+    63: 'তেষট্টি',
+    64: 'চৌষট্টি',
+    65: 'পঁয়ষট্টি',
+    66: 'ছেষট্টি',
+    67: 'সাতষট্টি',
+    68: 'আটষট্টি',
+    69: 'ঊনসত্তর',
+    70: 'সত্তর',
+    71: 'একাত্তর',
+    72: 'বাহাত্তর',
+    73: 'তিয়াত্তর',
+    74: 'চুয়াত্তর',
+    75: 'পঁচাত্তর',
+    76: 'ছিয়াত্তর',
+    77: 'সাতাত্তর',
+    78: 'আটাত্তর',
+    79: 'ঊনআশি',
+    80: 'আশি',
+    81: 'একাশি',
+    82: 'বিরাশি',
+    83: 'তিরাশি',
+    84: 'চুরাশি',
+    85: 'পঁচাশি',
+    86: 'ছিয়াশি',
+    87: 'সাতাশি',
+    88: 'আটাশি',
+    89: 'ঊননব্বই',
+    90: 'নব্বই',
+    91: 'একানব্বই',
+    92: 'বিরানব্বই',
+    93: 'তিরানব্বই',
+    94: 'চুরানব্বই',
+    95: 'পঁচানব্বই',
+    96: 'ছিয়ানব্বই',
+    97: 'সাতানব্বই',
+    98: 'আটানব্বই',
+    99: 'নিরানব্বই',
+  };
+
+  String small(int n) {
+    String w = '';
+    if (n >= 100) {
+      w += '${banglaNumbers[n ~/ 100]} শত ';
+      n %= 100;
+    }
+    if (n > 0) {
+      w += '${banglaNumbers[n]} ';
+    }
+    return w.trim();
+  }
+
+  String words = '';
+  if (number >= 10000000) {
+    words += '${small(number ~/ 10000000)} কোটি ';
+    number %= 10000000;
+  }
+  if (number >= 100000) {
+    words += '${small(number ~/ 100000)} লাখ ';
+    number %= 100000;
+  }
+  if (number >= 1000) {
+    words += '${small(number ~/ 1000)} হাজার ';
+    number %= 1000;
+  }
+  if (number > 0) words += small(number);
+  return words.trim();
 }
