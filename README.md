@@ -1,159 +1,56 @@
-# 🚀 Masum Smart Calculator Pro V2
+# 🚀 Masum Smart Calculator Pro
 
-A powerful Smart Scientific Calculator & Business Utility App built with Flutter + Firebase.
+A modern Smart Scientific Calculator and Small Business Utility App built with Flutter and Firebase.
+
+Masum Smart Calculator Pro is designed for daily calculation, scientific calculation, Bangla number words, PDF reports, business records, customer notes, receipt/memo, and cloud backup.
 
 ---
 
 ## 📲 Download APK
 
-👉 [Download Latest APK](https://github.com/masum462441/masum_calc_pro_v2/releases/download/v1.0.0/app-release.apk)
+👉 [Download Latest APK](https://github.com/masum462441/masum_calc_pro_v2/releases/latest/download/app-release.apk)
 
 ---
 
-# ✨ Features
+## ✨ Main Features
 
-✅ Smart Scientific Calculator  
-✅ Business হিসাব System  
+✅ Normal Calculator  
+✅ Scientific Calculator  
+✅ Bangla Number Word  
+✅ English/Bangla Support  
+✅ Copy, Share, Save and PDF Export  
+✅ Smart History System  
+✅ Saved Calculations  
+✅ Business Notebook  
+✅ Customer Notes  
+✅ Due / Payment Tracker  
+✅ Daily Cashbook  
+✅ Reminder System  
+✅ Receipt / Memo Generator  
+✅ Shop / Business Profile  
 ✅ Firebase Cloud Backup  
 ✅ Google/Gmail Login  
 ✅ Restore Data After Reinstall  
-✅ PDF Export & Share  
-✅ WhatsApp Sharing  
-✅ Smart History System  
-✅ Bangla + English Support  
-✅ Premium Dark UI  
-✅ Fast & Smooth Performance  
+✅ Premium Dark & Light Theme  
+✅ Fast and Smooth User Experience  
 
 ---
 
-# 🧮 Scientific Calculator
+## 🧮 Calculator Features
 
-✔️ Percentage Calculation  
-✔️ Square Root  
-✔️ Power (x²)  
-✔️ π Value  
-✔️ Bracket Calculation  
-✔️ Advanced Scientific Operations  
+- Normal Calculator
+- Scientific Calculator
+- Percentage calculation
+- Square root
+- Power calculation
+- π support
+- Bracket calculation
+- Bangla amount in words
+- Instant result copy
+- Instant result PDF
+- Calculation save system
 
----
+Example:
 
-# ☁️ Cloud Backup System
-
-Secure Firebase Cloud Integration.
-
-Users can:
-
-- Backup all হিসাব
-- Restore data after reinstall
-- Sync data with Gmail login
-- Access saved হিসাব anytime
-
----
-
-# 👨‍💼 Business হিসাব System
-
-Store:
-
-- Person Name
-- হিসাব Title
-- Notes
-- Amount
-- Date & Time
-
-Perfect for:
-
-✅ Small Business  
-✅ দোকান হিসাব  
-✅ Personal Finance  
-✅ Due Tracking  
-
----
-
-# 📄 PDF Export
-
-Generate beautiful PDF reports instantly.
-
-✔️ Export হিসাব  
-✔️ Print হিসাব  
-✔️ Share PDF  
-
----
-
-# 📤 WhatsApp Share
-
-Share হিসাব directly to:
-
-- WhatsApp
-- Facebook
-- Messenger
-- Other apps
-
----
-
-# 🌐 Multi Language Support
-
-✅ Bangla  
-✅ English  
-
----
-
-# ⚡ Smart Utility Tools
-
-✔️ Age Calculator  
-✔️ BMI Calculator  
-✔️ EMI Calculator  
-✔️ Discount Calculator  
-✔️ Profit/Loss Calculator  
-✔️ Unit Converter  
-
----
-
-# 🎨 UI Design
-
-🔥 Modern Dark Theme  
-🔥 Smooth Animation  
-🔥 Responsive Design  
-🔥 Custom Splash Screen  
-🔥 Premium User Experience  
-
----
-
-# 🛠 Built With
-
-💙 Flutter  
-🔥 Firebase  
-☁️ Cloud Firestore  
-🔐 Google Authentication  
-📄 PDF Packages  
-
----
-
-# 👨‍💻 Developer
-
-Farabi Ahmed
-
----
-
-# 📲 Download Now
-
-👉 APK Download:
-
-https://github.com/masum462441/masum_calc_pro_v2/releases/download/v1.0.0/app-release.apk
-
----
-
-# ⭐ Support
-
-If you like this project:
-
-⭐ Star this repository  
-📢 Share with friends  
-❤️ Give feedback  
-
----
-
-# 🔥 Version
-
-Version: v1.0.0
-
-Official First Release 🚀
+```text
+4000 × 20% = 800
