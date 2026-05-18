@@ -1,5 +1,6 @@
-package com.example.masum_calc_pro_v2
+package com.masum.smartcalculatorpro
 
 import io.flutter.embedding.android.FlutterActivity
 
 class MainActivity : FlutterActivity()
+
