@@ -50,3 +50,9 @@ android/app/google-services.json
 
 # Do not push nested copied project folder
 masum_calc_pro_v2/
+
+# Android signing secrets
+android/key.properties
+*.jks
+*.keystore
+upload-keystore.jks
