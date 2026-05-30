@@ -10,6 +10,9 @@ import 'package:printing/printing.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'daily_expense_page.dart';
+import 'pack_price_calculator_page.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
@@ -1520,178 +1523,107 @@ class _CalculatorPageState extends State<CalculatorPage> {
     double fontSize, {
     bool scientificPanel = false,
   }) {
-    final isEqual = text == '=';
-    final isDanger = text == 'C' || text == 'AC' || text == '⌫';
-    final isOperatorBtn = scientificPanel
-        ? ['+', '-', '×', '÷'].contains(text)
-        : ['+', '-', '×', '÷', '%', '√', 'x²', 'π', '(', ')'].contains(text);
-    final isScienceBtn = [
-      '2nd',
-      'xʸ',
-      'Deg',
-      'deg',
-      'sin',
-      'cos',
-      'tan',
-      'sinh',
-      'cosh',
-      'tanh',
-      'log',
-      'log₁₀',
-      'ln',
-      'x!',
-      '1/x',
-      'e',
-      'Rand',
-      'mc',
-      'm+',
-      'm-',
-      'mr',
-      'x³',
-      'eˣ',
-      '10ˣ',
-      '²√x',
-      '³√x',
-      'ʸ√x',
-      'EE',
-      '+/-',
-      'π',
-      '(',
-      ')',
-      '%',
-    ].contains(text);
-    late Color topColor, bottomColor, borderColor, textColor, glowColor;
+    final bool isDanger = text == 'C' || text == 'AC' || text == '⌫';
 
-    if (isEqual) {
-      topColor = const Color(0xFFFFB143);
-      bottomColor = const Color(0xFFFF9500);
-      borderColor = Colors.white.withOpacity(0.10);
-      textColor = Colors.white;
-      glowColor = Colors.black;
-    } else if (isDanger) {
-      topColor = widget.darkMode
-          ? const Color(0xFFB8B8B8)
-          : const Color(0xFFDADADA);
-      bottomColor = widget.darkMode
-          ? const Color(0xFF9B9B9B)
-          : const Color(0xFFC7C7CC);
-      borderColor = Colors.white.withOpacity(0.08);
-      textColor = const Color(0xFF101010);
-      glowColor = Colors.black;
-    } else if (isOperatorBtn) {
-      topColor = const Color(0xFFFFB143);
-      bottomColor = const Color(0xFFFF9500);
-      borderColor = Colors.white.withOpacity(0.09);
-      textColor = Colors.white;
-      glowColor = Colors.black;
-    } else if (isScienceBtn) {
-      topColor = widget.darkMode
-          ? const Color(0xFF242426)
-          : const Color(0xFFE1E1E5);
-      bottomColor = widget.darkMode
-          ? const Color(0xFF1C1C1E)
-          : const Color(0xFFD1D1D6);
-      borderColor = widget.darkMode
-          ? Colors.white.withOpacity(0.06)
-          : Colors.black.withOpacity(0.04);
-      textColor = widget.darkMode ? Colors.white : const Color(0xFF111111);
-      glowColor = Colors.black;
-    } else {
-      topColor = widget.darkMode ? const Color(0xFF333335) : Colors.white;
-      bottomColor = widget.darkMode
-          ? const Color(0xFF2C2C2E)
-          : const Color(0xFFE5E5EA);
-      borderColor = widget.darkMode
-          ? Colors.white.withOpacity(0.06)
-          : Colors.black.withOpacity(0.04);
-      textColor = widget.darkMode ? Colors.white : const Color(0xFF111111);
-      glowColor = Colors.black;
-    }
+    final bool isOperatorBtn =
+        scientificPanel ||
+        text == '+' ||
+        text == '-' ||
+        text == '×' ||
+        text == '÷' ||
+        text == '=' ||
+        text == '%' ||
+        text == '√' ||
+        text == 'x²' ||
+        text == 'π' ||
+        text == '(' ||
+        text == ')' ||
+        text == '+/-';
+
+    final Color topColor = isDanger
+        ? (widget.darkMode ? const Color(0xFFE1E1E1) : const Color(0xFFF7F7F7))
+        : isOperatorBtn
+        ? const Color(0xFFFFA726)
+        : (widget.darkMode ? const Color(0xFF343437) : const Color(0xFFF8F8F8));
+
+    final Color bottomColor = isDanger
+        ? (widget.darkMode ? const Color(0xFFBDBDBD) : const Color(0xFFE4E4E4))
+        : isOperatorBtn
+        ? const Color(0xFFFF8500)
+        : (widget.darkMode ? const Color(0xFF202124) : const Color(0xFFE8E8E8));
+
+    final Color labelColor = isDanger
+        ? const Color(0xFF151515)
+        : isOperatorBtn
+        ? Colors.white
+        : mainTextColor;
 
     return Expanded(
       child: Padding(
-        padding: const EdgeInsets.all(4.5),
+        padding: const EdgeInsets.all(5.2),
         child: PressScale(
-          borderRadius: BorderRadius.circular(23),
+          borderRadius: BorderRadius.circular(15),
           onTap: () => press(text),
           child: AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
+            duration: const Duration(milliseconds: 160),
             curve: Curves.easeOutCubic,
             decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(23),
+              borderRadius: BorderRadius.circular(15),
               gradient: LinearGradient(
-                colors: [topColor, bottomColor],
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
+                colors: [topColor, bottomColor],
               ),
-              border: Border.all(color: borderColor, width: 1),
+              border: Border.all(
+                color: widget.darkMode
+                    ? Colors.white.withOpacity(isOperatorBtn ? 0.12 : 0.08)
+                    : Colors.black.withOpacity(0.045),
+                width: 1,
+              ),
               boxShadow: [
                 BoxShadow(
-                  color: glowColor.withOpacity(widget.darkMode ? 0.22 : 0.08),
-                  blurRadius: 10,
+                  color: isOperatorBtn
+                      ? const Color(
+                          0xFFFF8A00,
+                        ).withOpacity(widget.darkMode ? 0.28 : 0.22)
+                      : Colors.black.withOpacity(widget.darkMode ? 0.30 : 0.11),
+                  blurRadius: isOperatorBtn ? 12 : 9,
                   offset: const Offset(0, 5),
                 ),
                 BoxShadow(
                   color: Colors.white.withOpacity(
-                    widget.darkMode ? 0.015 : 0.10,
+                    widget.darkMode ? 0.04 : 0.72,
                   ),
-                  blurRadius: 1,
-                  offset: const Offset(0, -1),
+                  blurRadius: 4,
+                  offset: const Offset(-1.5, -1.5),
                 ),
               ],
             ),
-            child: Stack(
-              children: [
-                Positioned(
-                  top: 5,
-                  left: 11,
-                  right: 11,
-                  child: Container(
-                    height: 14,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(20),
-                      gradient: LinearGradient(
-                        colors: [
-                          Colors.white.withOpacity(
-                            isOperatorBtn || isDanger || isEqual ? 0.10 : 0.04,
-                          ),
-                          Colors.white.withOpacity(0),
+            child: Center(
+              child: text == '⌫'
+                  ? Icon(
+                      Icons.backspace_rounded,
+                      color: labelColor,
+                      size: 21 * fontSize / 20,
+                    )
+                  : Text(
+                      text,
+                      maxLines: 1,
+                      style: TextStyle(
+                        color: labelColor,
+                        fontSize: fontSize,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                        shadows: [
+                          if (isOperatorBtn)
+                            Shadow(
+                              color: Colors.black.withOpacity(0.16),
+                              blurRadius: 2,
+                              offset: const Offset(0, 1),
+                            ),
                         ],
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
                       ),
                     ),
-                  ),
-                ),
-                Center(
-                  child: text == '⌫'
-                      ? Icon(
-                          Icons.backspace_rounded,
-                          color: textColor,
-                          size: 22,
-                        )
-                      : FittedBox(
-                          child: Text(
-                            (text == 'deg' || text == 'Deg')
-                                ? (degreeMode ? 'Deg' : 'Rad')
-                                : text,
-                            style: TextStyle(
-                              fontSize: fontSize,
-                              fontWeight: FontWeight.w900,
-                              color: textColor,
-                              shadows: [
-                                if (widget.darkMode)
-                                  Shadow(
-                                    color: Colors.black.withOpacity(0.30),
-                                    blurRadius: 4,
-                                    offset: const Offset(0, 1),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        ),
-                ),
-              ],
             ),
           ),
         ),
@@ -2321,6 +2253,34 @@ class _CalculatorPageState extends State<CalculatorPage> {
                           children: [
                             Expanded(
                               child: menuTile(
+                                icon: Icons.inventory_2_rounded,
+                                title: 'Pack Price',
+                                subtitle: 'Box, pata & pcs',
+                                colors: const [
+                                  Color(0xFFFFA31A),
+                                  Color(0xFFFF7C00),
+                                ],
+                                onTap: () {
+                                  Navigator.pop(context);
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => PackPriceCalculatorPage(
+                                        darkMode: widget.darkMode,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 10),
+
+                        Row(
+                          children: [
+                            Expanded(
+                              child: menuTile(
                                 icon: Icons.lock_rounded,
                                 title: 'App Lock',
                                 subtitle: 'PIN',
@@ -2435,78 +2395,6 @@ class _CalculatorPageState extends State<CalculatorPage> {
                           ),
                         ),
                         const SizedBox(height: 10),
-                        PressScale(
-                          borderRadius: BorderRadius.circular(22),
-                          pressedScale: 0.98,
-                          onTap: () {
-                            Navigator.pop(context);
-                            widget.onThemeChanged(!widget.darkMode);
-                          },
-                          child: Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 14,
-                              vertical: 14,
-                            ),
-                            decoration: BoxDecoration(
-                              color: widget.darkMode
-                                  ? const Color(0xFF151517).withOpacity(0.70)
-                                  : Colors.white.withOpacity(0.70),
-                              borderRadius: BorderRadius.circular(22),
-                              border: Border.all(
-                                color: widget.darkMode
-                                    ? Colors.white.withOpacity(0.08)
-                                    : Colors.black.withOpacity(0.06),
-                              ),
-                            ),
-                            child: Row(
-                              children: [
-                                Container(
-                                  height: 44,
-                                  width: 44,
-                                  decoration: BoxDecoration(
-                                    gradient: LinearGradient(
-                                      colors: widget.darkMode
-                                          ? [
-                                              const Color(0xFFFFD86B),
-                                              const Color(0xFFFF8A00),
-                                            ]
-                                          : [
-                                              const Color(0xFF293BFF),
-                                              const Color(0xFF151517),
-                                            ],
-                                    ),
-                                    borderRadius: BorderRadius.circular(17),
-                                  ),
-                                  child: Icon(
-                                    widget.darkMode
-                                        ? Icons.light_mode_rounded
-                                        : Icons.dark_mode_rounded,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                                const SizedBox(width: 12),
-                                Expanded(
-                                  child: Text(
-                                    widget.darkMode
-                                        ? 'Switch to Light Mode'
-                                        : 'Switch to Dark Mode',
-                                    style: TextStyle(
-                                      color: mainTextColor,
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w900,
-                                    ),
-                                  ),
-                                ),
-                                Icon(
-                                  Icons.arrow_forward_ios_rounded,
-                                  color: mutedTextColor,
-                                  size: 16,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
                       ],
                     ),
                   ),
@@ -2535,35 +2423,132 @@ class _CalculatorPageState extends State<CalculatorPage> {
                 color: scientificMode ? equalBtn : card2,
                 shape: BoxShape.circle,
                 border: Border.all(color: Colors.white12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(
+                      widget.darkMode ? 0.28 : 0.10,
+                    ),
+                    blurRadius: 10,
+                    offset: const Offset(0, 5),
+                  ),
+                ],
               ),
               child: Icon(
                 scientificMode
                     ? Icons.calculate_rounded
                     : Icons.science_rounded,
                 size: 18,
+                color: scientificMode ? Colors.white : mainTextColor,
               ),
             ),
           ),
+
           Expanded(
             child: Center(
-              child: AnimatedSwitcher(
-                duration: const Duration(milliseconds: 220),
-                child: Text(
-                  scientificMode ? 'Calc+ Scientific' : 'Calc+',
-                  key: ValueKey(scientificMode),
-                  style: TextStyle(
-                    fontSize: 19 * fontScale,
-                    fontWeight: FontWeight.w900,
-                    color: mainTextColor,
+              child: PressScale(
+                borderRadius: BorderRadius.circular(999),
+                onTap: () {
+                  HapticFeedback.lightImpact();
+                  widget.onThemeChanged(!widget.darkMode);
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeOutCubic,
+                  height: 34,
+                  width: 132,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(999),
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: widget.darkMode
+                          ? [
+                              const Color(0xFF5A6870).withOpacity(0.95),
+                              const Color(0xFF344149).withOpacity(0.95),
+                            ]
+                          : [Colors.white, const Color(0xFFE9EEF2)],
+                    ),
+                    border: Border.all(
+                      color: widget.darkMode
+                          ? Colors.white.withOpacity(0.16)
+                          : Colors.black.withOpacity(0.06),
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(
+                          widget.darkMode ? 0.30 : 0.12,
+                        ),
+                        blurRadius: 16,
+                        offset: const Offset(0, 7),
+                      ),
+                    ],
+                  ),
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      AnimatedAlign(
+                        duration: const Duration(milliseconds: 260),
+                        curve: Curves.easeOutCubic,
+                        alignment: widget.darkMode
+                            ? Alignment.centerRight
+                            : Alignment.centerLeft,
+                        child: Container(
+                          height: 26,
+                          width: 48,
+                          decoration: BoxDecoration(
+                            color: widget.darkMode
+                                ? const Color(0xFF6A7780)
+                                : Colors.white,
+                            borderRadius: BorderRadius.circular(999),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.18),
+                                blurRadius: 8,
+                                offset: const Offset(0, 3),
+                              ),
+                            ],
+                          ),
+                          child: Icon(
+                            widget.darkMode
+                                ? Icons.nightlight_round
+                                : Icons.wb_sunny_rounded,
+                            size: 17,
+                            color: widget.darkMode
+                                ? const Color(0xFFFFC857)
+                                : const Color(0xFFFFB000),
+                          ),
+                        ),
+                      ),
+                      Align(
+                        alignment: widget.darkMode
+                            ? Alignment.centerLeft
+                            : Alignment.centerRight,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Text(
+                            widget.darkMode ? 'Dark' : 'Light',
+                            style: TextStyle(
+                              color: widget.darkMode
+                                  ? Colors.white
+                                  : const Color(0xFF37474F),
+                              fontSize: 12 * fontScale,
+                              fontWeight: FontWeight.w900,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
             ),
           ),
+
           TextButton(
             onPressed: toggleWordLanguage,
             child: Text(
-              banglaWord ? 'English' : 'বাংলা',
+              banglaWord ? 'EN' : 'বাংলা',
               style: TextStyle(
                 color: opBtn,
                 fontSize: 12 * fontScale,
@@ -2571,6 +2556,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
               ),
             ),
           ),
+
           PressScale(
             borderRadius: BorderRadius.circular(16),
             onTap: openCloudBackupSheet,
@@ -2600,6 +2586,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
               ),
             ),
           ),
+
           PressScale(
             borderRadius: BorderRadius.circular(18),
             onTap: openPremiumMenu,
@@ -2806,40 +2793,100 @@ class _CalculatorPageState extends State<CalculatorPage> {
       );
     }
 
-    return Container(
-      height: scientificMode ? 38 : 46,
-      margin: EdgeInsets.fromLTRB(10, 0, 10, scientificMode ? 4 : 8),
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        physics: const BouncingScrollPhysics(),
-        child: Row(
-          children: [
-            dockItem(
-              icon: Icons.copy_rounded,
-              label: 'Copy',
-              colors: const [Color(0xFFFFB143), Color(0xFFFF9500)],
-              onTap: copyResult,
+    Widget expenseButton() {
+      return PressScale(
+        borderRadius: BorderRadius.circular(18),
+        pressedScale: 0.97,
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => DailyExpensePage(darkMode: widget.darkMode),
             ),
-            dockItem(
-              icon: Icons.share_rounded,
-              label: 'Share',
-              colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)],
-              onTap: shareCalculatorResult,
+          );
+        },
+        child: Container(
+          height: scientificMode ? 34 : 40,
+          width: double.infinity,
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+              colors: [Color(0xFF30C96B), Color(0xFF0F9D58)],
             ),
-            dockItem(
-              icon: Icons.picture_as_pdf_rounded,
-              label: 'PDF',
-              colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)],
-              onTap: exportCalculatorPdfDirect,
-            ),
-            dockItem(
-              icon: Icons.save_rounded,
-              label: 'Save',
-              colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)],
-              onTap: saveDialog,
-            ),
-          ],
+            borderRadius: BorderRadius.circular(18),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF0F9D58).withOpacity(0.22),
+                blurRadius: 14,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.receipt_long_rounded,
+                color: Colors.white,
+                size: scientificMode ? 16 : 18,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Daily Expense',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: (scientificMode ? 11 : 13) * fontScale,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
+          ),
         ),
+      );
+    }
+
+    return Container(
+      height: scientificMode ? 80 : 94,
+      margin: EdgeInsets.fromLTRB(10, 0, 10, scientificMode ? 4 : 8),
+      child: Column(
+        children: [
+          SizedBox(
+            height: scientificMode ? 38 : 46,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              physics: const BouncingScrollPhysics(),
+              child: Row(
+                children: [
+                  dockItem(
+                    icon: Icons.copy_rounded,
+                    label: 'Copy',
+                    colors: const [Color(0xFFFFB143), Color(0xFFFF9500)],
+                    onTap: copyResult,
+                  ),
+                  dockItem(
+                    icon: Icons.share_rounded,
+                    label: 'Share',
+                    colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)],
+                    onTap: shareCalculatorResult,
+                  ),
+                  dockItem(
+                    icon: Icons.picture_as_pdf_rounded,
+                    label: 'PDF',
+                    colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)],
+                    onTap: exportCalculatorPdfDirect,
+                  ),
+                  dockItem(
+                    icon: Icons.save_rounded,
+                    label: 'Save',
+                    colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)],
+                    onTap: saveDialog,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          SizedBox(height: scientificMode ? 4 : 6),
+          expenseButton(),
+        ],
       ),
     );
   }
