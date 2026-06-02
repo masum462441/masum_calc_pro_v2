@@ -339,6 +339,12 @@ class AuthBackupService {
           prefs.getStringList('due_payment_records') ?? <String>[],
       'daily_cashbook_entries':
           prefs.getStringList('daily_cashbook_entries') ?? <String>[],
+      'daily_money_entries_v1':
+          prefs.getStringList('daily_money_entries_v1') ?? <String>[],
+      'daily_money_deleted_entries_v1':
+          prefs.getStringList('daily_money_deleted_entries_v1') ?? <String>[],
+      'daily_expense_bangla_ui_v1':
+          prefs.getBool('daily_expense_bangla_ui_v1') ?? false,
       'followup_reminders':
           prefs.getStringList('followup_reminders') ?? <String>[],
       'receipt_memos': prefs.getStringList('receipt_memos') ?? <String>[],
@@ -403,6 +409,21 @@ class AuthBackupService {
     await prefs.setStringList(
       'daily_cashbook_entries',
       List<String>.from(data['daily_cashbook_entries'] ?? const <String>[]),
+    );
+
+    await prefs.setStringList(
+      'daily_money_entries_v1',
+      List<String>.from(data['daily_money_entries_v1'] ?? const <String>[]),
+    );
+    await prefs.setStringList(
+      'daily_money_deleted_entries_v1',
+      List<String>.from(
+        data['daily_money_deleted_entries_v1'] ?? const <String>[],
+      ),
+    );
+    await prefs.setBool(
+      'daily_expense_bangla_ui_v1',
+      data['daily_expense_bangla_ui_v1'] == true,
     );
     await prefs.setStringList(
       'followup_reminders',
@@ -2801,7 +2822,10 @@ class _CalculatorPageState extends State<CalculatorPage> {
           Navigator.push(
             context,
             MaterialPageRoute(
-              builder: (_) => DailyExpensePage(darkMode: widget.darkMode),
+              builder: (_) => DailyExpensePage(
+                darkMode: widget.darkMode,
+                onDataChanged: AuthBackupService.scheduleAutoBackup,
+              ),
             ),
           );
         },
@@ -3891,19 +3915,6 @@ class ToolsPage extends StatelessWidget {
                     context,
                     MaterialPageRoute(
                       builder: (_) => EMILoanCalculatorPage(darkMode: darkMode),
-                    ),
-                  ),
-                ),
-                toolCard(
-                  context: context,
-                  icon: Icons.person_rounded,
-                  title: 'About Developer',
-                  subtitle: 'Contact, WhatsApp, Email and Feedback',
-                  colors: const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)],
-                  onTap: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => AboutDeveloperPage(darkMode: darkMode),
                     ),
                   ),
                 ),

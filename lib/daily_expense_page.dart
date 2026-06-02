@@ -65,9 +65,13 @@ class DailyMoneyEntry {
 
 class DailyExpensePage extends StatefulWidget {
   final bool darkMode;
+  final VoidCallback? onDataChanged;
 
-  const DailyExpensePage({super.key, required this.darkMode});
-
+  const DailyExpensePage({
+    super.key,
+    required this.darkMode,
+    this.onDataChanged,
+  });
   @override
   State<DailyExpensePage> createState() => _DailyExpensePageState();
 }
@@ -351,10 +355,18 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
 
   Future<void> saveEntries() async {
     final prefs = await SharedPreferences.getInstance();
+
     await prefs.setStringList(
       storageKey,
       entries.map((e) => jsonEncode(e.toJson())).toList(),
     );
+
+    await prefs.setStringList(
+      deletedStorageKey,
+      deletedEntries.map((e) => jsonEncode(e.toJson())).toList(),
+    );
+
+    widget.onDataChanged?.call();
   }
 
   String money(double value) {
