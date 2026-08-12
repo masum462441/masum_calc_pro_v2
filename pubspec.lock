@@ -489,7 +489,7 @@ packages:
     source: hosted
     version: "2.6.0"
   path_provider_linux:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: path_provider_linux
       sha256: f7a1fe3a634fe7734c8d3f2766ad746ae2a2884abe22e241a8b301bf5cac3279
@@ -505,7 +505,7 @@ packages:
     source: hosted
     version: "2.1.2"
   path_provider_windows:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: path_provider_windows
       sha256: bd6f00dbd873bfb70d0761682da2b3a2c2fccc2b9e84c495821639601d81afe7
@@ -617,7 +617,7 @@ packages:
     source: hosted
     version: "2.5.6"
   shared_preferences_linux:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: shared_preferences_linux
       sha256: "580abfd40f415611503cae30adf626e6656dfb2f0cee8f465ece7b6defb40f2f"
@@ -641,7 +641,7 @@ packages:
     source: hosted
     version: "2.4.3"
   shared_preferences_windows:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: shared_preferences_windows
       sha256: "94ef0f72b2d71bc3e700e025db3710911bd51a71cefb65cc609dd0d9a982e3c1"
@@ -742,7 +742,7 @@ packages:
     source: hosted
     version: "6.4.1"
   url_launcher_linux:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: url_launcher_linux
       sha256: d5e14138b3bc193a0f63c10a53c94b91d399df0512b1f29b94a043db7482384a
@@ -774,7 +774,7 @@ packages:
     source: hosted
     version: "2.4.3"
   url_launcher_windows:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: url_launcher_windows
       sha256: "712c70ab1b99744ff066053cbe3e80c73332b38d46e5e945c98689b2e66fc15f"

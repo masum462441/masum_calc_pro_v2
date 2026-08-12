@@ -1,5 +1,5 @@
 name: masum_calc_pro_v2
-description: Masum Smart Calculator Pro - Smart Scientific Calculator and Business Utility App.
+description: HisabFlow - Smart Scientific Calculator and Business Utility App.
 publish_to: 'none'
 
 version: 1.0.2+3
@@ -23,12 +23,6 @@ dependencies:
   firebase_auth: 5.7.0
   cloud_firestore: 5.6.12
   google_sign_in: 6.3.0
-  path_provider_linux: ^2.2.1
-  path_provider_windows: ^2.3.0
-  shared_preferences_linux: ^2.4.1
-  shared_preferences_windows: ^2.4.1
-  url_launcher_linux: ^3.2.2
-  url_launcher_windows: ^3.1.5
 
 dev_dependencies:
   flutter_test:
@@ -51,6 +45,7 @@ flutter_launcher_icons:
   adaptive_icon_foreground: "assets/images/icon_foreground.png"
   adaptive_icon_background: "#000000"
   min_sdk_android: 21
+
   web:
     generate: true
     image_path: "assets/images/icon.png"
@@ -63,10 +58,11 @@ flutter_native_splash:
   android: true
   ios: true
   web: true
+
   android_12:
     color: "#000000"
     image: assets/images/icon_splash.png
-google_sign_in_android: 6.2.1
+
 dependency_overrides:
   google_sign_in_android: 6.2.1
   path_provider_android: 2.2.15

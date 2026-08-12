@@ -74,7 +74,7 @@ class _CalculatorRootState extends State<CalculatorRoot> {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Masum Smart Calculator Pro',
+      title: 'HisabFlow',
       themeMode: darkMode ? ThemeMode.dark : ThemeMode.light,
       darkTheme: ThemeData.dark(useMaterial3: true),
       theme: ThemeData.light(useMaterial3: true),
@@ -809,7 +809,7 @@ Future<void> exportTextPdf(
               crossAxisAlignment: pw.CrossAxisAlignment.start,
               children: [
                 pw.Text(
-                  'Masum Smart Calculator Pro',
+                  'HisabFlow',
                   style: pw.TextStyle(
                     color: PdfColors.white,
                     fontSize: 22,
@@ -869,7 +869,7 @@ Future<void> exportTextPdf(
               borderRadius: pw.BorderRadius.circular(10),
             ),
             child: pw.Text(
-              'Shared from Masum Smart Calculator Pro',
+              'Shared from HisabFlow',
               style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey700),
             ),
           ),
@@ -895,7 +895,7 @@ void showShareSheet(
   required String title,
   required String text,
 }) {
-  final fullText = '$title\n\n$text\n\nShared from Masum Smart Calculator Pro';
+  final fullText = '$title\n\n$text\n\nShared from HisabFlow';
   showDialog(
     context: context,
     builder: (_) => AlertDialog(
@@ -6753,10 +6753,10 @@ class AboutDeveloperPage extends StatelessWidget {
   const AboutDeveloperPage({super.key, required this.darkMode});
 
   static const String developerName = 'Masum';
-  static const String appName = 'Masum Smart Calculator Pro';
+  static const String appName = 'HisabFlow';
   static const String whatsappNumber = '8801820806464';
   static const String emailAddress = 'farabi13577@gmail.com';
-  static const String portfolioUrl = 'https://masum462441.github.io/portfolio/';
+  static const String portfolioUrl = 'https://masumtechdev.github.io/portfolio/';
 
   Color get bg => darkMode ? const Color(0xFF000000) : const Color(0xFFF4F7FB);
   Color get mainText => darkMode ? Colors.white : const Color(0xFF151517);
@@ -6780,7 +6780,7 @@ class AboutDeveloperPage extends StatelessWidget {
   }
 
   void openEmail() {
-    final subject = Uri.encodeComponent('Masum Smart Calculator Pro');
+    final subject = Uri.encodeComponent('HisabFlow');
     final body = Uri.encodeComponent('Hello Masum,');
     openUrl(
       'https://mail.google.com/mail/?view=cm&fs=1&to=$emailAddress&su=$subject&body=$body',
@@ -6854,11 +6854,11 @@ class AboutDeveloperPage extends StatelessWidget {
               }
 
               final encodedFeedback = Uri.encodeComponent(
-                'Assalamu Alaikum Masum,\n\nI am using Masum Smart Calculator Pro.\n\nMy feedback:\n$feedback',
+                'Assalamu Alaikum Masum,\n\nI am using HisabFlow.\n\nMy feedback:\n$feedback',
               );
 
               final subject = Uri.encodeComponent(
-                'Feedback for Masum Smart Calculator Pro',
+                'Feedback for HisabFlow',
               );
               final gmailUrl =
                   'https://mail.google.com/mail/?view=cm&fs=1&to=$emailAddress&su=$subject&body=$encodedFeedback';
@@ -7328,7 +7328,7 @@ class AboutDeveloperPage extends StatelessWidget {
       child: Column(
         children: [
           Text(
-            'Built with care by Masum',
+            'Developed by Masum Technical Support Bangladesh',
             style: TextStyle(
               color: mainText,
               fontSize: 16,
@@ -7877,7 +7877,7 @@ class _PinLockGateState extends State<PinLockGate> {
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  'Masum App Lock',
+                  'HisabFlow App Lock',
                   style: TextStyle(
                     color: mainText,
                     fontSize: 24,
@@ -8354,7 +8354,7 @@ class ShopProfile {
   });
 
   factory ShopProfile.empty() => ShopProfile(
-    shopName: 'Masum Smart Calculator Pro',
+    shopName: 'HisabFlow',
     ownerName: '',
     phone: '',
     address: '',
@@ -8372,7 +8372,7 @@ class ShopProfile {
   };
 
   factory ShopProfile.fromJson(Map<String, dynamic> json) => ShopProfile(
-    shopName: json['shopName'] ?? 'Masum Smart Calculator Pro',
+    shopName: json['shopName'] ?? 'HisabFlow',
     ownerName: json['ownerName'] ?? '',
     phone: json['phone'] ?? '',
     address: json['address'] ?? '',
@@ -8836,7 +8836,7 @@ class _BusinessNotebookPageState extends State<BusinessNotebookPage> {
               setState(() {
                 shopProfile = ShopProfile(
                   shopName: shopName.text.trim().isEmpty
-                      ? 'Masum Smart Calculator Pro'
+                      ? 'HisabFlow'
                       : shopName.text.trim(),
                   ownerName: ownerName.text.trim(),
                   phone: phone.text.trim(),
@@ -9050,19 +9050,19 @@ class _BusinessNotebookPageState extends State<BusinessNotebookPage> {
       exportBusinessPdf(
         'Customer Notebook Report',
         customerReportText(filteredCustomers, 'Customer Notebook Report'),
-        'masum_customer_notebook.pdf',
+        'hisabflow_customer_notebook.pdf',
       );
     if (tabIndex == 1)
       exportBusinessPdf(
         'Due Payment Report',
         dueReportText(filteredDues, 'Due Payment Report'),
-        'masum_due_payment_report.pdf',
+        'hisabflow_due_payment_report.pdf',
       );
     if (tabIndex == 2)
       exportBusinessPdf(
         'Daily Cashbook Report',
         cashbookReportText(filteredCashbook, 'Daily Cashbook Report'),
-        'masum_daily_cashbook_report.pdf',
+        'hisabflow_daily_cashbook_report.pdf',
       );
     if (tabIndex == 3) {
       final b = StringBuffer()
@@ -9081,7 +9081,7 @@ class _BusinessNotebookPageState extends State<BusinessNotebookPage> {
       exportBusinessPdf(
         'Follow-up Reminders',
         b.toString(),
-        'masum_followup_reminders.pdf',
+        'hisabflow_followup_reminders.pdf',
       );
     }
     if (tabIndex == 4) {
@@ -9097,7 +9097,7 @@ class _BusinessNotebookPageState extends State<BusinessNotebookPage> {
       exportBusinessPdf(
         'Receipt / Memo Report',
         b.toString(),
-        'masum_receipt_memo_report.pdf',
+        'hisabflow_receipt_memo_report.pdf',
       );
     }
   }
