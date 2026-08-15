@@ -56,3 +56,8 @@ android/key.properties
 *.jks
 *.keystore
 upload-keystore.jks
+
+android/key.properties
+*.jks
+*.keystore
+.env

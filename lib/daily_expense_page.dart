@@ -7,6 +7,8 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'hisabflow_theme.dart';
+
 class DailyMoneyEntry {
   final String id;
   final String type; // Expense or Income
@@ -120,19 +122,23 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
   DateTime? fromDate;
   DateTime? toDate;
 
-  Color get bg =>
-      widget.darkMode ? const Color(0xFF050505) : const Color(0xFFF7FBFF);
-  Color get card => widget.darkMode ? const Color(0xFF151517) : Colors.white;
-  Color get card2 =>
-      widget.darkMode ? const Color(0xFF1F1F22) : const Color(0xFFEAF1FA);
+  Color get bg => widget.darkMode
+      ? HisabFlowColors.darkBackground
+      : HisabFlowColors.lightBackground;
+  Color get card => widget.darkMode
+      ? HisabFlowColors.darkSurface
+      : HisabFlowColors.lightSurface;
+  Color get card2 => widget.darkMode
+      ? HisabFlowColors.darkSurface2
+      : HisabFlowColors.lightSurface2;
   Color get mainText =>
-      widget.darkMode ? Colors.white : const Color(0xFF071323);
+      widget.darkMode ? HisabFlowColors.darkText : HisabFlowColors.lightText;
   Color get mutedText =>
-      widget.darkMode ? Colors.white70 : const Color(0xFF5C6470);
-  Color get orange => const Color(0xFFFFA31A);
-  Color get green => const Color(0xFF30C96B);
-  Color get red => const Color(0xFFFF5A5A);
-  Color get cyan => const Color(0xFF22D3EE);
+      widget.darkMode ? HisabFlowColors.darkMuted : HisabFlowColors.lightMuted;
+  Color get orange => HisabFlowColors.orange;
+  Color get green => HisabFlowColors.green;
+  Color get red => HisabFlowColors.red;
+  Color get cyan => HisabFlowColors.cyan;
 
   @override
   void initState() {
@@ -496,8 +502,8 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                   ),
                   border: Border.all(
                     color: widget.darkMode
-                        ? Colors.white.withOpacity(0.10)
-                        : Colors.black.withOpacity(0.06),
+                        ? Colors.white.withValues(alpha: 0.10)
+                        : Colors.black.withValues(alpha: 0.06),
                   ),
                 ),
                 child: SafeArea(
@@ -509,9 +515,11 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                         Row(
                           children: [
                             Text(
-                              editItem == null
-                                  ? 'Add Daily Record'
-                                  : 'Edit Record',
+                              dxLabel(
+                                editItem == null
+                                    ? 'Add Daily Record'
+                                    : 'Edit Record',
+                              ),
                               style: TextStyle(
                                 color: mainText,
                                 fontSize: 20,
@@ -566,7 +574,9 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                           amountCtrl,
                           dxLabel('Amount'),
                           Icons.payments_rounded,
-                          keyboardType: TextInputType.number,
+                          keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true,
+                          ),
                         ),
                         const SizedBox(height: 10),
                         Row(
@@ -729,9 +739,11 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                             },
                             icon: const Icon(Icons.save_rounded),
                             label: Text(
-                              editItem == null
-                                  ? 'Save Record'
-                                  : 'Update Record',
+                              dxLabel(
+                                editItem == null
+                                    ? 'Save Record'
+                                    : 'Update Record',
+                              ),
                               style: const TextStyle(
                                 fontWeight: FontWeight.w900,
                               ),
@@ -842,7 +854,10 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
           style: TextStyle(color: mainText),
         ),
         content: Text(
-          'This record will be removed from the main list, but you can restore it later from Deleted History.',
+          ui(
+            'This record will be removed from the main list, but you can restore it later from Deleted History.',
+            'রেকর্ডটি মূল তালিকা থেকে সরবে, তবে Deleted History থেকে পরে ফিরিয়ে আনতে পারবেন।',
+          ),
           style: TextStyle(color: mutedText),
         ),
         actions: [
@@ -850,7 +865,10 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
             onPressed: toggleLanguage,
             child: Text(
               banglaUi ? 'EN' : 'বাংলা',
-              style: TextStyle(color: orange, fontWeight: FontWeight.w900),
+              style: TextStyle(
+                color: HisabFlowColors.primary,
+                fontWeight: FontWeight.w900,
+              ),
             ),
           ),
           TextButton(
@@ -865,41 +883,45 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
       ),
     );
 
-    if (ok == true) {
-      final deletedItem = DailyMoneyEntry(
-        id: item.id,
-        type: item.type,
-        dateTime: item.dateTime,
-        title: item.title,
-        category: item.category,
-        amount: item.amount,
-        paymentMethod: item.paymentMethod,
-        note: item.note,
-        createdAt: item.createdAt,
-        updatedAt: DateTime.now(),
-      );
+    if (ok != true) return;
 
-      setState(() {
-        entries.removeWhere((e) => e.id == item.id);
-        deletedEntries.insert(0, deletedItem);
-      });
+    final deletedItem = DailyMoneyEntry(
+      id: item.id,
+      type: item.type,
+      dateTime: item.dateTime,
+      title: item.title,
+      category: item.category,
+      amount: item.amount,
+      paymentMethod: item.paymentMethod,
+      note: item.note,
+      createdAt: item.createdAt,
+      updatedAt: DateTime.now(),
+    );
 
-      await saveEntries();
+    setState(() {
+      entries.removeWhere((e) => e.id == item.id);
+      deletedEntries.insert(0, deletedItem);
+    });
 
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              ui('Moved to Deleted History', 'ডিলিট হিস্ট্রিতে রাখা হয়েছে'),
-            ),
-            action: SnackBarAction(
-              label: 'OPEN',
-              onPressed: openDeletedHistory,
-            ),
-          ),
-        );
-      }
-    }
+    await saveEntries();
+
+    if (!mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+
+    // Remove any previous snackbar immediately so delete notifications
+    // never stack or remain visible for a long time.
+    messenger.hideCurrentSnackBar();
+
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(
+          ui('Moved to Deleted History', 'ডিলিট হিস্ট্রিতে রাখা হয়েছে'),
+        ),
+        duration: const Duration(milliseconds: 900),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   Future<void> restoreDeletedEntry(DailyMoneyEntry item) async {
@@ -929,7 +951,7 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
           style: TextStyle(color: mainText),
         ),
         content: Text(
-          'This cannot be restored again.',
+          ui('This cannot be restored again.', 'এটি আর ফিরিয়ে আনা যাবে না।'),
           style: TextStyle(color: mutedText),
         ),
         actions: [
@@ -976,8 +998,8 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                 ),
                 border: Border.all(
                   color: widget.darkMode
-                      ? Colors.white.withOpacity(0.10)
-                      : Colors.black.withOpacity(0.06),
+                      ? Colors.white.withValues(alpha: 0.10)
+                      : Colors.black.withValues(alpha: 0.06),
                 ),
               ),
               child: SafeArea(
@@ -1040,7 +1062,7 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                                         width: 46,
                                         decoration: BoxDecoration(
                                           color: (isIncome ? green : red)
-                                              .withOpacity(0.15),
+                                              .withValues(alpha: 0.15),
                                           borderRadius: BorderRadius.circular(
                                             16,
                                           ),
@@ -1288,12 +1310,15 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
           ),
           IconButton(
             onPressed: exportPdf,
-            icon: Icon(Icons.picture_as_pdf_rounded, color: orange),
+            icon: const Icon(
+              Icons.picture_as_pdf_rounded,
+              color: HisabFlowColors.primary,
+            ),
           ),
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        backgroundColor: orange,
+        backgroundColor: HisabFlowColors.primary,
         foregroundColor: Colors.white,
         onPressed: () => openEntrySheet(),
         icon: const Icon(Icons.add_rounded),
@@ -1303,53 +1328,63 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
         ),
       ),
       body: Center(
-        child: Container(
-          width: MediaQuery.of(context).size.width > 700
-              ? 460
-              : double.infinity,
-          padding: const EdgeInsets.fromLTRB(14, 6, 14, 90),
-          child: ListView(
-            children: [
-              _summaryCard(income: income, expense: expense, balance: balance),
-              const SizedBox(height: 12),
-              _filterCard(),
-              const SizedBox(height: 12),
-              Text(
-                ' ()',
-                style: TextStyle(
-                  color: mainText,
-                  fontSize: 18,
-                  fontWeight: FontWeight.w900,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 720),
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              HisabFlowResponsive.horizontalPadding(context),
+              6,
+              HisabFlowResponsive.horizontalPadding(context),
+              90,
+            ),
+            child: ListView(
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              children: [
+                _summaryCard(
+                  income: income,
+                  expense: expense,
+                  balance: balance,
                 ),
-              ),
-              const SizedBox(height: 10),
-              if (list.isEmpty)
-                Container(
-                  padding: const EdgeInsets.all(22),
-                  decoration: BoxDecoration(
-                    color: card,
-                    borderRadius: BorderRadius.circular(22),
+                const SizedBox(height: 12),
+                _filterCard(),
+                const SizedBox(height: 12),
+                Text(
+                  '${dxLabel('Records')} (${list.length})',
+                  style: TextStyle(
+                    color: mainText,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w900,
                   ),
-                  child: Text(
-                    ui(
-                      dxLabel(
-                        'No record found. Tap Add to save your expense or income.',
+                ),
+                const SizedBox(height: 10),
+                if (list.isEmpty)
+                  Container(
+                    padding: const EdgeInsets.all(22),
+                    decoration: BoxDecoration(
+                      color: card,
+                      borderRadius: BorderRadius.circular(22),
+                    ),
+                    child: Text(
+                      ui(
+                        dxLabel(
+                          'No record found. Tap Add to save your expense or income.',
+                        ),
+                        'কোনো রেকর্ড নেই। যোগ করুন চাপুন।',
                       ),
-                      'কোনো রেকর্ড নেই। যোগ করুন চাপুন।',
+                      style: TextStyle(
+                        color: mutedText,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
-                    style: TextStyle(
-                      color: mutedText,
-                      fontWeight: FontWeight.w700,
-                    ),
+                  )
+                else
+                  ...list.asMap().entries.map(
+                    (row) => _entryCard(row.value, row.key + 1),
                   ),
-                )
-              else
-                ...list.asMap().entries.map(
-                  (row) => _entryCard(row.value, row.key + 1),
-                ),
-              if (expSummary.isNotEmpty) const SizedBox(height: 12),
-              if (expSummary.isNotEmpty) _categoryCard(expSummary),
-            ],
+                if (expSummary.isNotEmpty) const SizedBox(height: 12),
+                if (expSummary.isNotEmpty) _categoryCard(expSummary),
+              ],
+            ),
           ),
         ),
       ),
@@ -1364,13 +1399,11 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFFFFA31A), Color(0xFFFF7C00)],
-        ),
+        gradient: HisabFlowColors.brandGradient,
         borderRadius: BorderRadius.circular(26),
         boxShadow: [
           BoxShadow(
-            color: orange.withOpacity(0.25),
+            color: HisabFlowColors.primary.withValues(alpha: 0.22),
             blurRadius: 18,
             offset: const Offset(0, 10),
           ),
@@ -1429,7 +1462,7 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
       width: full ? double.infinity : null,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.18),
+        color: Colors.white.withValues(alpha: 0.18),
         borderRadius: BorderRadius.circular(18),
       ),
       child: Row(
@@ -1529,7 +1562,7 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                 style: TextStyle(color: mainText, fontWeight: FontWeight.w900),
               ),
               style: OutlinedButton.styleFrom(
-                side: BorderSide(color: red.withOpacity(0.45)),
+                side: BorderSide(color: red.withValues(alpha: 0.45)),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(16),
                 ),
@@ -1569,7 +1602,7 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
                 children: [
                   Expanded(
                     child: Text(
-                      e.key,
+                      dxLabel(e.key),
                       style: TextStyle(
                         color: mainText,
                         fontWeight: FontWeight.w800,
@@ -1607,7 +1640,7 @@ class _DailyExpensePageState extends State<DailyExpensePage> {
             height: 48,
             width: 48,
             decoration: BoxDecoration(
-              color: (isIncome ? green : red).withOpacity(0.15),
+              color: (isIncome ? green : red).withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(18),
             ),
             child: Icon(

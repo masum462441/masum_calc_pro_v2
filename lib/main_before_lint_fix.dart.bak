@@ -10,12 +10,9 @@ import 'package:printing/printing.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:package_info_plus/package_info_plus.dart';
 
 import 'daily_expense_page.dart';
-import 'hisabflow_ai_page.dart';
 import 'pack_price_calculator_page.dart';
-import 'hisabflow_theme.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_app_check/firebase_app_check.dart';
@@ -25,23 +22,13 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // PERFORMANCE: paint the local calculator UI immediately. Firebase, App
-  // Check, Google login, cloud backup and update services initialize in the
-  // background, so a slow network can never hold the first screen for up to
-  // eight seconds.
-  runApp(const MasumCalcApp());
-  unawaited(_initializeFirebaseInBackground());
-}
-
-Future<void> _initializeFirebaseInBackground() async {
   try {
-    if (Firebase.apps.isEmpty) {
-      await Firebase.initializeApp().timeout(const Duration(seconds: 8));
-    }
-    AuthBackupService.setFirebaseReady(true);
+    // Firebase must be initialized before Auth, Firestore, backup, and App Check.
+    await Firebase.initializeApp().timeout(const Duration(seconds: 8));
+    AuthBackupService.firebaseReady = true;
 
-    // App Check is deliberately isolated from core Firebase readiness. A Play
-    // Integrity/debug-provider issue must not disable login or cloud backup.
+    // Keep App Check separate so an App Check setup problem does not turn off
+    // the app's existing Firebase-ready flag for Google login and cloud backup.
     try {
       const bool isRelease = bool.fromEnvironment('dart.vm.product');
 
@@ -60,10 +47,12 @@ Future<void> _initializeFirebaseInBackground() async {
       debugPrint('Firebase App Check initialization skipped: $appCheckError');
     }
   } catch (firebaseError) {
-    // HisabFlow remains fully usable offline when Firebase is unavailable.
-    AuthBackupService.setFirebaseReady(false);
+    // App must still open if Firebase configuration/network is unavailable.
+    AuthBackupService.firebaseReady = false;
     debugPrint('Firebase init skipped: $firebaseError');
   }
+
+  runApp(const MasumCalcApp());
 }
 
 class MasumCalcApp extends StatelessWidget {
@@ -91,9 +80,8 @@ class _CalculatorRootState extends State<CalculatorRoot> {
 
   Future<void> loadTheme() async {
     final prefs = await SharedPreferences.getInstance();
-    final savedDarkMode = prefs.getBool('dark_mode') ?? true;
-    if (!mounted || savedDarkMode == darkMode) return;
-    setState(() => darkMode = savedDarkMode);
+    if (!mounted) return;
+    setState(() => darkMode = prefs.getBool('dark_mode') ?? true);
   }
 
   Future<void> changeTheme(bool value) async {
@@ -110,8 +98,8 @@ class _CalculatorRootState extends State<CalculatorRoot> {
       debugShowCheckedModeBanner: false,
       title: 'HisabFlow',
       themeMode: darkMode ? ThemeMode.dark : ThemeMode.light,
-      darkTheme: HisabFlowTheme.dark(),
-      theme: HisabFlowTheme.light(),
+      darkTheme: ThemeData.dark(useMaterial3: true),
+      theme: ThemeData.light(useMaterial3: true),
       home: PinLockGate(
         darkMode: darkMode,
         child: CalculatorPage(darkMode: darkMode, onThemeChanged: changeTheme),
@@ -261,31 +249,8 @@ Future<void> saveSmartToolHistoryList(List<SmartToolHistoryItem> items) async {
 
 class AuthBackupService {
   static bool firebaseReady = false;
-  static bool _firebaseInitializationFinished = false;
-  static final Completer<void> _firebaseReadyCompleter = Completer<void>();
   static Timer? _autoBackupTimer;
   static bool _autoBackupRunning = false;
-
-  static void setFirebaseReady(bool value) {
-    firebaseReady = value;
-    _firebaseInitializationFinished = true;
-    if (!_firebaseReadyCompleter.isCompleted) {
-      _firebaseReadyCompleter.complete();
-    }
-  }
-
-  static Future<bool> waitUntilFirebaseReady({
-    Duration timeout = const Duration(seconds: 10),
-  }) async {
-    if (_firebaseInitializationFinished) return firebaseReady;
-
-    try {
-      await _firebaseReadyCompleter.future.timeout(timeout);
-    } catch (_) {
-      // A timeout is intentionally silent. The app is offline-first.
-    }
-    return firebaseReady;
-  }
 
   static FirebaseAuth? get _auth {
     if (!firebaseReady) return null;
@@ -344,17 +309,10 @@ class AuthBackupService {
   static Future<User?> signInWithGoogle({
     bool forceAccountPicker = false,
   }) async {
-    // With fast startup the user can tap Google sign-in before background
-    // Firebase initialization finishes. Wait briefly here instead of blocking
-    // the whole app at launch.
-    if (!firebaseReady) {
-      await waitUntilFirebaseReady();
-    }
-
     final auth = _auth;
     if (auth == null) {
       throw Exception(
-        'Firebase is not ready. Check Firebase configuration/internet first.',
+        'Firebase is not ready. Check Firebase web config first.',
       );
     }
 
@@ -523,633 +481,6 @@ class AuthBackupService {
     );
     await prefs.setString('pin_recovery_uid', data['pin_recovery_uid'] ?? '');
     return true;
-  }
-}
-
-// =============================================================================
-// HISABFLOW UPDATE CENTER + WHAT'S NEW
-// =============================================================================
-//
-// Remote update data is read from this Firestore document:
-//   app_config / hisabflow_android
-//
-// Suggested fields:
-//   enabled: true
-//   latestVersionCode: 5
-//   latestVersionName: "2.1.0"
-//   minimumVersionCode: 4
-//   forceUpdate: false
-//   updateTitle: "A new HisabFlow update is ready"
-//   updateMessage: "Update for the latest improvements and fixes."
-//   updateUrl: "https://play.google.com/store/apps/details?id=com.masum.smartcalculatorpro"
-//   whatsNew: ["Feature 1", "Feature 2"]
-//
-// Existing user data, Google login, cloud backup, PIN, history, and business
-// records are not changed by this service.
-
-class HisabFlowUpdateInfo {
-  final bool enabled;
-  final bool updateAvailable;
-  final bool forceUpdate;
-  final int currentBuild;
-  final int latestBuild;
-  final int minimumBuild;
-  final String currentVersion;
-  final String latestVersion;
-  final String title;
-  final String message;
-  final String updateUrl;
-  final List<String> whatsNew;
-
-  const HisabFlowUpdateInfo({
-    required this.enabled,
-    required this.updateAvailable,
-    required this.forceUpdate,
-    required this.currentBuild,
-    required this.latestBuild,
-    required this.minimumBuild,
-    required this.currentVersion,
-    required this.latestVersion,
-    required this.title,
-    required this.message,
-    required this.updateUrl,
-    required this.whatsNew,
-  });
-}
-
-class HisabFlowUpdateService {
-  HisabFlowUpdateService._();
-
-  static const String _configCollection = 'app_config';
-  static const String _configDocument = 'hisabflow_android';
-  static const String _playStoreUrl =
-      'https://play.google.com/store/apps/details?id=com.masum.smartcalculatorpro';
-
-  static const String _lastCheckKey = 'hisabflow_update_last_check_ms_v1';
-  static const String _remindAfterKey = 'hisabflow_update_remind_after_ms_v1';
-  static const String _whatsNewSeenBuildKey =
-      'hisabflow_whats_new_seen_build_v1';
-
-  static const Duration _automaticCheckInterval = Duration(hours: 12);
-  static const Duration _laterReminderDelay = Duration(hours: 6);
-
-  /// Keep this list updated before each Play Store release.
-  ///
-  /// It is intentionally local so "What's New" can still appear immediately
-  /// after an app update even when the device is temporarily offline.
-  static const List<String> currentReleaseNotes = <String>[
-    'HisabFlow Assistant upgraded for Bangla, English and Banglish questions.',
-    'Exact business calculations improved for profit, loss, due, discount, percentage and unit price.',
-    'New premium HisabFlow logo, launcher icon and splash branding.',
-    'Update notification and What’s New system added.',
-    'Google login, cloud backup, App Lock, PDF reports and existing records remain protected.',
-  ];
-
-  static Future<PackageInfo> packageInfo() {
-    return PackageInfo.fromPlatform();
-  }
-
-  static int _toInt(dynamic value, {int fallback = 0}) {
-    if (value is int) return value;
-    if (value is num) return value.toInt();
-    return int.tryParse(value?.toString() ?? '') ?? fallback;
-  }
-
-  static bool _toBool(dynamic value, {bool fallback = false}) {
-    if (value is bool) return value;
-    final String text = value?.toString().trim().toLowerCase() ?? '';
-    if (text == 'true' || text == '1' || text == 'yes') return true;
-    if (text == 'false' || text == '0' || text == 'no') return false;
-    return fallback;
-  }
-
-  static List<String> _toStringList(dynamic value) {
-    if (value is Iterable) {
-      return value
-          .map((item) => item.toString().trim())
-          .where((item) => item.isNotEmpty)
-          .toList();
-    }
-    return const <String>[];
-  }
-
-  static Future<HisabFlowUpdateInfo?> fetchUpdateInfo() async {
-    // Startup no longer waits for Firebase. Update checking can wait in the
-    // background without delaying the calculator UI.
-    if (!AuthBackupService.firebaseReady) {
-      final ready = await AuthBackupService.waitUntilFirebaseReady(
-        timeout: const Duration(seconds: 6),
-      );
-      if (!ready) return null;
-    }
-
-    final PackageInfo local = await packageInfo();
-    final int currentBuild = _toInt(local.buildNumber);
-
-    final doc = await FirebaseFirestore.instance
-        .collection(_configCollection)
-        .doc(_configDocument)
-        .get()
-        .timeout(const Duration(seconds: 8));
-
-    if (!doc.exists) return null;
-
-    final Map<String, dynamic> data = doc.data() ?? <String, dynamic>{};
-
-    final bool enabled = _toBool(data['enabled'], fallback: true);
-    if (!enabled) {
-      return HisabFlowUpdateInfo(
-        enabled: false,
-        updateAvailable: false,
-        forceUpdate: false,
-        currentBuild: currentBuild,
-        latestBuild: currentBuild,
-        minimumBuild: 0,
-        currentVersion: local.version,
-        latestVersion: local.version,
-        title: 'HisabFlow Update',
-        message: '',
-        updateUrl: _playStoreUrl,
-        whatsNew: const <String>[],
-      );
-    }
-
-    final int latestBuild = _toInt(
-      data['latestVersionCode'],
-      fallback: currentBuild,
-    );
-    final int minimumBuild = _toInt(data['minimumVersionCode']);
-    final bool updateAvailable = latestBuild > currentBuild;
-
-    final bool forceByFlag = _toBool(data['forceUpdate']);
-    final bool forceByMinimum = minimumBuild > 0 && currentBuild < minimumBuild;
-    final bool forceUpdate = updateAvailable && (forceByFlag || forceByMinimum);
-
-    final String latestVersion =
-        (data['latestVersionName']?.toString().trim().isNotEmpty ?? false)
-        ? data['latestVersionName'].toString().trim()
-        : latestBuild.toString();
-
-    final String title =
-        (data['updateTitle']?.toString().trim().isNotEmpty ?? false)
-        ? data['updateTitle'].toString().trim()
-        : 'New HisabFlow update available';
-
-    final String message =
-        (data['updateMessage']?.toString().trim().isNotEmpty ?? false)
-        ? data['updateMessage'].toString().trim()
-        : 'Update HisabFlow to get the latest improvements, fixes and features.';
-
-    final String remoteUrl = data['updateUrl']?.toString().trim() ?? '';
-    final String updateUrl = remoteUrl.startsWith('https://')
-        ? remoteUrl
-        : _playStoreUrl;
-
-    final List<String> remoteWhatsNew = _toStringList(data['whatsNew']);
-
-    return HisabFlowUpdateInfo(
-      enabled: true,
-      updateAvailable: updateAvailable,
-      forceUpdate: forceUpdate,
-      currentBuild: currentBuild,
-      latestBuild: latestBuild,
-      minimumBuild: minimumBuild,
-      currentVersion: local.version,
-      latestVersion: latestVersion,
-      title: title,
-      message: message,
-      updateUrl: updateUrl,
-      whatsNew: remoteWhatsNew,
-    );
-  }
-
-  static Future<void> runStartupChecks(BuildContext context) async {
-    if (!context.mounted) return;
-
-    await showWhatsNewIfNeeded(context);
-
-    if (!context.mounted) return;
-
-    // Small gap prevents two dialogs from visually colliding on launch.
-    await Future<void>.delayed(const Duration(milliseconds: 350));
-
-    if (!context.mounted) return;
-
-    await checkForUpdates(context);
-  }
-
-  static Future<void> showWhatsNewIfNeeded(BuildContext context) async {
-    try {
-      final PackageInfo info = await packageInfo();
-      final int currentBuild = _toInt(info.buildNumber);
-
-      if (currentBuild <= 0 || !context.mounted) return;
-
-      final SharedPreferences prefs = await SharedPreferences.getInstance();
-
-      final int seenBuild = prefs.getInt(_whatsNewSeenBuildKey) ?? 0;
-
-      if (seenBuild == currentBuild) return;
-
-      if (!context.mounted) return;
-
-      await _showWhatsNewDialog(
-        context,
-        version: info.version,
-        build: info.buildNumber,
-        notes: currentReleaseNotes,
-      );
-
-      await prefs.setInt(_whatsNewSeenBuildKey, currentBuild);
-    } catch (error) {
-      debugPrint('What’s New check skipped: $error');
-    }
-  }
-
-  static Future<void> showCurrentWhatsNew(BuildContext context) async {
-    try {
-      final PackageInfo info = await packageInfo();
-
-      if (!context.mounted) return;
-
-      await _showWhatsNewDialog(
-        context,
-        version: info.version,
-        build: info.buildNumber,
-        notes: currentReleaseNotes,
-      );
-    } catch (_) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Version information is not available right now.'),
-        ),
-      );
-    }
-  }
-
-  static Future<void> checkForUpdates(
-    BuildContext context, {
-    bool manual = false,
-  }) async {
-    final SharedPreferences prefs = await SharedPreferences.getInstance();
-    final int now = DateTime.now().millisecondsSinceEpoch;
-
-    if (!manual) {
-      final int remindAfter = prefs.getInt(_remindAfterKey) ?? 0;
-      if (remindAfter > now) return;
-
-      final int lastCheck = prefs.getInt(_lastCheckKey) ?? 0;
-      final int intervalMs = _automaticCheckInterval.inMilliseconds;
-      if (lastCheck > 0 && now - lastCheck < intervalMs) return;
-    }
-
-    await prefs.setInt(_lastCheckKey, now);
-
-    if (!AuthBackupService.firebaseReady) {
-      final ready = await AuthBackupService.waitUntilFirebaseReady(
-        timeout: const Duration(seconds: 6),
-      );
-      if (!ready) {
-        if (manual && context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(
-                'Update check needs Firebase/internet. Please try again when online.',
-              ),
-            ),
-          );
-        }
-        return;
-      }
-    }
-
-    try {
-      final HisabFlowUpdateInfo? info = await fetchUpdateInfo();
-
-      if (!context.mounted) return;
-
-      if (info == null || !info.enabled) {
-        if (manual) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('No update information is published yet.'),
-            ),
-          );
-        }
-        return;
-      }
-
-      if (!info.updateAvailable) {
-        await prefs.remove(_remindAfterKey);
-
-        if (manual && context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('HisabFlow ${info.currentVersion} is up to date.'),
-            ),
-          );
-        }
-        return;
-      }
-
-      if (!context.mounted) return;
-
-      await _showUpdateDialog(context, info);
-    } catch (error) {
-      debugPrint('HisabFlow update check failed: $error');
-
-      if (manual && context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Could not check for updates. Check internet/Firebase and try again.',
-            ),
-          ),
-        );
-      }
-    }
-  }
-
-  static Future<void> _showUpdateDialog(
-    BuildContext context,
-    HisabFlowUpdateInfo info,
-  ) async {
-    final List<String> notes = info.whatsNew.isNotEmpty
-        ? info.whatsNew
-        : currentReleaseNotes;
-
-    await showDialog<void>(
-      context: context,
-      barrierDismissible: !info.forceUpdate,
-      builder: (dialogContext) {
-        final bool dark = Theme.of(dialogContext).brightness == Brightness.dark;
-
-        return PopScope(
-          canPop: !info.forceUpdate,
-          child: AlertDialog(
-            backgroundColor: dark ? const Color(0xFF111214) : Colors.white,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(28),
-            ),
-            titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
-            contentPadding: const EdgeInsets.fromLTRB(20, 6, 20, 8),
-            actionsPadding: const EdgeInsets.fromLTRB(14, 4, 14, 14),
-            title: Row(
-              children: [
-                Container(
-                  height: 48,
-                  width: 48,
-                  decoration: BoxDecoration(
-                    gradient: const LinearGradient(
-                      colors: [Color(0xFF8B5CF6), Color(0xFF22D3EE)],
-                    ),
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                  child: const Icon(
-                    Icons.system_update_alt_rounded,
-                    color: Colors.white,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    info.forceUpdate ? 'Update required' : info.title,
-                    style: const TextStyle(fontWeight: FontWeight.w900),
-                  ),
-                ),
-              ],
-            ),
-            content: ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 430),
-              child: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      info.message,
-                      style: TextStyle(
-                        color: dark ? Colors.white70 : Colors.black87,
-                        height: 1.4,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: dark
-                            ? const Color(0xFF1C1C1E)
-                            : const Color(0xFFF4F7FB),
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                      child: Text(
-                        'Current: ${info.currentVersion} '
-                        '(Build ${info.currentBuild})\n'
-                        'Latest: ${info.latestVersion} '
-                        '(Build ${info.latestBuild})',
-                        style: const TextStyle(
-                          height: 1.5,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                    ),
-                    if (notes.isNotEmpty) ...[
-                      const SizedBox(height: 14),
-                      const Text(
-                        'What’s new',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      ...notes.map(
-                        (note) => Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Padding(
-                                padding: EdgeInsets.only(top: 3),
-                                child: Icon(
-                                  Icons.check_circle_rounded,
-                                  color: Color(0xFF30C96B),
-                                  size: 17,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  note,
-                                  style: TextStyle(
-                                    color: dark
-                                        ? Colors.white70
-                                        : Colors.black87,
-                                    height: 1.35,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                    if (info.forceUpdate) ...[
-                      const SizedBox(height: 8),
-                      const Text(
-                        'This version is too old to continue safely. '
-                        'Please update from Google Play.',
-                        style: TextStyle(
-                          color: Colors.orangeAccent,
-                          fontWeight: FontWeight.w800,
-                          height: 1.35,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              if (!info.forceUpdate)
-                TextButton(
-                  onPressed: () async {
-                    final SharedPreferences prefs =
-                        await SharedPreferences.getInstance();
-                    final int remindAt = DateTime.now()
-                        .add(_laterReminderDelay)
-                        .millisecondsSinceEpoch;
-                    await prefs.setInt(_remindAfterKey, remindAt);
-
-                    if (dialogContext.mounted) {
-                      Navigator.of(dialogContext).pop();
-                    }
-                  },
-                  child: const Text('Later'),
-                ),
-              ElevatedButton.icon(
-                onPressed: () async {
-                  if (!info.forceUpdate && dialogContext.mounted) {
-                    Navigator.of(dialogContext).pop();
-                  }
-
-                  await openExternalUrl(info.updateUrl);
-                },
-                icon: const Icon(Icons.shop_rounded),
-                label: const Text('Update Now'),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  static Future<void> _showWhatsNewDialog(
-    BuildContext context, {
-    required String version,
-    required String build,
-    required List<String> notes,
-  }) async {
-    if (!context.mounted) return;
-
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        final bool dark = Theme.of(dialogContext).brightness == Brightness.dark;
-
-        return AlertDialog(
-          backgroundColor: dark ? const Color(0xFF111214) : Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(28),
-          ),
-          titlePadding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
-          contentPadding: const EdgeInsets.fromLTRB(20, 6, 20, 8),
-          actionsPadding: const EdgeInsets.fromLTRB(14, 4, 14, 14),
-          title: Row(
-            children: [
-              Container(
-                height: 48,
-                width: 48,
-                decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    colors: [Color(0xFF22D3EE), Color(0xFF7C4DFF)],
-                  ),
-                  borderRadius: BorderRadius.circular(18),
-                ),
-                child: const Icon(
-                  Icons.auto_awesome_rounded,
-                  color: Colors.white,
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  'What’s New in HisabFlow $version',
-                  style: const TextStyle(fontWeight: FontWeight.w900),
-                ),
-              ),
-            ],
-          ),
-          content: ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 430),
-            child: SingleChildScrollView(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Build $build',
-                    style: const TextStyle(
-                      color: Color(0xFF22D3EE),
-                      fontWeight: FontWeight.w900,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  ...notes.map(
-                    (note) => Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: Row(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Padding(
-                            padding: EdgeInsets.only(top: 2),
-                            child: Icon(
-                              Icons.check_circle_rounded,
-                              color: Color(0xFF30C96B),
-                              size: 18,
-                            ),
-                          ),
-                          const SizedBox(width: 9),
-                          Expanded(
-                            child: Text(
-                              note,
-                              style: TextStyle(
-                                color: dark ? Colors.white70 : Colors.black87,
-                                height: 1.4,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          actions: [
-            ElevatedButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('Got it'),
-            ),
-          ],
-        );
-      },
-    );
   }
 }
 
@@ -1724,19 +1055,6 @@ class _CalculatorPageState extends State<CalculatorPage> {
   final List<SavedCalculation> savedItems = [];
   User? firebaseUser;
   StreamSubscription<User?>? authSub;
-  bool _saveAllDataRunning = false;
-  bool _saveAllDataQueued = false;
-  Timer? _wordPreviewTimer;
-
-  // The keypad is visually static while the user types. Cache its immutable
-  // widget trees so every digit press only rebuilds the changing display/data
-  // areas instead of recreating dozens of decorated buttons.
-  List<Widget>? _normalButtonsCache;
-  double? _normalButtonsScale;
-  bool? _normalButtonsDarkMode;
-  List<Widget>? _scientificButtonsCache;
-  double? _scientificButtonsScale;
-  bool? _scientificButtonsDarkMode;
 
   // Human-made matte palette: AMOLED background, iPhone-style orange operators,
   // charcoal number keys, soft grey action keys. No heavy neon glow.
@@ -1761,116 +1079,50 @@ class _CalculatorPageState extends State<CalculatorPage> {
   @override
   void initState() {
     super.initState();
-
-    // First paint the calculator. Preferences, login state and remote update
-    // checks start after the first frame so opening the app feels immediate.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(loadAllData());
-      unawaited(_bindFirebaseAuth());
-      unawaited(_runStartupUpdateChecks());
-    });
-  }
-
-  Future<void> _bindFirebaseAuth() async {
-    final ready = await AuthBackupService.waitUntilFirebaseReady();
-    if (!mounted || !ready) return;
-
-    final initialUser = AuthBackupService.currentUser;
-    if (firebaseUser?.uid != initialUser?.uid) {
-      setState(() => firebaseUser = initialUser);
-    }
-
-    await authSub?.cancel();
+    loadAllData();
+    firebaseUser = AuthBackupService.currentUser;
     authSub = AuthBackupService.authChanges.listen((user) {
-      if (!mounted || firebaseUser?.uid == user?.uid) return;
+      if (!mounted) return;
       setState(() => firebaseUser = user);
     });
   }
 
-  Future<void> _runStartupUpdateChecks() async {
-    // Give App Lock enough time to load first. If the calculator page is
-    // temporarily removed by the PIN screen, mounted becomes false and no
-    // update/What's New dialog can appear in front of the lock screen.
-    await Future<void>.delayed(const Duration(milliseconds: 2500));
-    if (!mounted) return;
-
-    await HisabFlowUpdateService.runStartupChecks(context);
-  }
-
   @override
   void dispose() {
-    _wordPreviewTimer?.cancel();
     authSub?.cancel();
     super.dispose();
   }
 
   Future<void> loadAllData() async {
     final prefs = await SharedPreferences.getInstance();
-    final savedList = prefs.getStringList('saved_calculations') ?? <String>[];
-    final autoList = prefs.getStringList('auto_history') ?? <String>[];
+    final savedList = prefs.getStringList('saved_calculations') ?? [];
+    final autoList = prefs.getStringList('auto_history') ?? [];
     final savedLanguage = prefs.getBool('bangla_word') ?? false;
-
-    // Decode outside setState. This keeps the UI mutation itself short even if
-    // a long history exists. Corrupt individual records are skipped instead of
-    // preventing the calculator from opening.
-    final decodedSaved = <SavedCalculation>[];
-    for (final item in savedList) {
-      try {
-        decodedSaved.add(SavedCalculation.fromJson(jsonDecode(item)));
-      } catch (_) {}
-    }
-
-    final decodedAuto = <AutoHistoryItem>[];
-    for (final item in autoList) {
-      try {
-        decodedAuto.add(AutoHistoryItem.fromJson(jsonDecode(item)));
-      } catch (_) {}
-    }
-
     if (!mounted) return;
     setState(() {
       banglaWord = savedLanguage;
-      savedItems
-        ..clear()
-        ..addAll(decodedSaved);
-      autoHistory
-        ..clear()
-        ..addAll(decodedAuto);
+      savedItems.clear();
+      autoHistory.clear();
+      for (final item in savedList)
+        savedItems.add(SavedCalculation.fromJson(jsonDecode(item)));
+      for (final item in autoList)
+        autoHistory.add(AutoHistoryItem.fromJson(jsonDecode(item)));
       updateWordText();
     });
   }
 
   Future<void> saveAllData() async {
-    // Coalesce overlapping writes. Rapid actions (favorite/delete/calculate)
-    // no longer start several full SharedPreferences writes at the same time.
-    if (_saveAllDataRunning) {
-      _saveAllDataQueued = true;
-      return;
-    }
-
-    _saveAllDataRunning = true;
-    try {
-      do {
-        _saveAllDataQueued = false;
-
-        final encodedSaved = savedItems
-            .map((item) => jsonEncode(item.toJson()))
-            .toList(growable: false);
-        final encodedAuto = autoHistory
-            .map((item) => jsonEncode(item.toJson()))
-            .toList(growable: false);
-        final language = banglaWord;
-
-        final prefs = await SharedPreferences.getInstance();
-        await prefs.setStringList('saved_calculations', encodedSaved);
-        await prefs.setStringList('auto_history', encodedAuto);
-        await prefs.setBool('bangla_word', language);
-      } while (_saveAllDataQueued);
-
-      AuthBackupService.scheduleAutoBackup();
-    } finally {
-      _saveAllDataRunning = false;
-    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      'saved_calculations',
+      savedItems.map((item) => jsonEncode(item.toJson())).toList(),
+    );
+    await prefs.setStringList(
+      'auto_history',
+      autoHistory.map((item) => jsonEncode(item.toJson())).toList(),
+    );
+    await prefs.setBool('bangla_word', banglaWord);
+    AuthBackupService.scheduleAutoBackup();
   }
 
   bool isOperator(String v) =>
@@ -1882,14 +1134,6 @@ class _CalculatorPageState extends State<CalculatorPage> {
     wordText = banglaWord
         ? 'মোট: ${numberToBanglaWords(number)} টাকা মাত্র'
         : 'Total: ${numberToEnglishWords(number)} Taka Only';
-  }
-
-  void _scheduleWordPreview() {
-    _wordPreviewTimer?.cancel();
-    _wordPreviewTimer = Timer(const Duration(milliseconds: 90), () {
-      if (!mounted) return;
-      setState(updateWordText);
-    });
   }
 
   void toggleWordLanguage() {
@@ -1947,8 +1191,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
   }
 
   void press(String v) {
-    final bool simpleDigit = RegExp(r'^[0-9.]$').hasMatch(v);
-    if (!simpleDigit) HapticFeedback.selectionClick();
+    HapticFeedback.selectionClick();
     setState(() {
       // Phone calculator flow fix: after "=" operator continues from result, number starts fresh.
       final isDigitButton = RegExp(r'^[0-9]$').hasMatch(v);
@@ -1971,9 +1214,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
       if (v == 'C' || v == 'AC') {
         expression = '';
         result = '0';
-        miniHistory.clear();
         justCalculated = false;
-        _wordPreviewTimer?.cancel();
         updateWordText();
         return;
       }
@@ -2160,14 +1401,14 @@ class _CalculatorPageState extends State<CalculatorPage> {
   void liveCalc() {
     if (expression.isEmpty) {
       result = '0';
-      _scheduleWordPreview();
+      updateWordText();
       return;
     }
     if (isOperator(expression[expression.length - 1])) return;
     try {
       final value = Parser(expression, degreeMode: degreeMode).parse();
       result = format(value);
-      _scheduleWordPreview();
+      updateWordText();
     } catch (_) {}
   }
 
@@ -2325,14 +1566,15 @@ class _CalculatorPageState extends State<CalculatorPage> {
     double fontSize, {
     bool scientificPanel = false,
   }) {
-    final bool isDigit = RegExp(r'^[0-9]$').hasMatch(text) || text == '.';
     final bool isDanger = text == 'C' || text == 'AC' || text == '⌫';
-    final bool isEqual = text == '=';
-    final bool isCoreOperator =
+
+    final bool isOperatorBtn =
+        scientificPanel ||
         text == '+' ||
         text == '-' ||
         text == '×' ||
         text == '÷' ||
+        text == '=' ||
         text == '%' ||
         text == '√' ||
         text == 'x²' ||
@@ -2340,77 +1582,89 @@ class _CalculatorPageState extends State<CalculatorPage> {
         text == '(' ||
         text == ')' ||
         text == '+/-';
-    final bool isScientificFunction =
-        scientificPanel && !isDigit && !isDanger && !isEqual && !isCoreOperator;
 
-    Color background;
-    Color labelColor;
-    Color borderColor;
+    final Color topColor = isDanger
+        ? (widget.darkMode ? const Color(0xFFE1E1E1) : const Color(0xFFF7F7F7))
+        : isOperatorBtn
+        ? const Color(0xFFFFA726)
+        : (widget.darkMode ? const Color(0xFF343437) : const Color(0xFFF8F8F8));
 
-    if (isEqual) {
-      background = const Color(0xFF0F766E);
-      labelColor = Colors.white;
-      borderColor = const Color(0xFF14B8A6).withValues(alpha: 0.45);
-    } else if (isDanger) {
-      background = widget.darkMode
-          ? const Color(0xFF2A1C1E)
-          : const Color(0xFFFFECEE);
-      labelColor = const Color(0xFFEF4444);
-      borderColor = const Color(0xFFEF4444).withValues(alpha: 0.22);
-    } else if (isCoreOperator) {
-      background = widget.darkMode
-          ? const Color(0xFF1F3A5F)
-          : const Color(0xFFDCEBFF);
-      labelColor = widget.darkMode ? Colors.white : const Color(0xFF174EA6);
-      borderColor = const Color(0xFF3B82F6).withValues(alpha: 0.22);
-    } else if (isScientificFunction) {
-      background = widget.darkMode
-          ? const Color(0xFF23232A)
-          : const Color(0xFFF0F1F5);
-      labelColor = widget.darkMode
-          ? const Color(0xFFD8D8E3)
-          : const Color(0xFF454554);
-      borderColor = widget.darkMode ? Colors.white10 : Colors.black12;
-    } else {
-      background = widget.darkMode
-          ? const Color(0xFF1C1C1E)
-          : const Color(0xFFF2F2F7);
-      labelColor = mainTextColor;
-      borderColor = widget.darkMode ? Colors.white10 : Colors.black12;
-    }
+    final Color bottomColor = isDanger
+        ? (widget.darkMode ? const Color(0xFFBDBDBD) : const Color(0xFFE4E4E4))
+        : isOperatorBtn
+        ? const Color(0xFFFF8500)
+        : (widget.darkMode ? const Color(0xFF202124) : const Color(0xFFE8E8E8));
 
-    final double radius = scientificPanel ? 13 : 18;
+    final Color labelColor = isDanger
+        ? const Color(0xFF151515)
+        : isOperatorBtn
+        ? Colors.white
+        : mainTextColor;
 
     return Expanded(
       child: Padding(
-        padding: EdgeInsets.all(scientificPanel ? 3.2 : 4.2),
+        padding: const EdgeInsets.all(5.2),
         child: PressScale(
-          borderRadius: BorderRadius.circular(radius),
-          pressedScale: 0.97,
+          borderRadius: BorderRadius.circular(15),
           onTap: () => press(text),
-          child: Container(
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 160),
+            curve: Curves.easeOutCubic,
             decoration: BoxDecoration(
-              color: background,
-              borderRadius: BorderRadius.circular(radius),
-              border: Border.all(color: borderColor),
+              borderRadius: BorderRadius.circular(15),
+              gradient: LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [topColor, bottomColor],
+              ),
+              border: Border.all(
+                color: widget.darkMode
+                    ? Colors.white.withOpacity(isOperatorBtn ? 0.12 : 0.08)
+                    : Colors.black.withOpacity(0.045),
+                width: 1,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: isOperatorBtn
+                      ? const Color(
+                          0xFFFF8A00,
+                        ).withOpacity(widget.darkMode ? 0.28 : 0.22)
+                      : Colors.black.withOpacity(widget.darkMode ? 0.30 : 0.11),
+                  blurRadius: isOperatorBtn ? 12 : 9,
+                  offset: const Offset(0, 5),
+                ),
+                BoxShadow(
+                  color: Colors.white.withOpacity(
+                    widget.darkMode ? 0.04 : 0.72,
+                  ),
+                  blurRadius: 4,
+                  offset: const Offset(-1.5, -1.5),
+                ),
+              ],
             ),
             child: Center(
               child: text == '⌫'
                   ? Icon(
                       Icons.backspace_rounded,
                       color: labelColor,
-                      size: scientificPanel ? 16 : 20,
+                      size: 21 * fontSize / 20,
                     )
                   : Text(
                       text,
                       maxLines: 1,
-                      overflow: TextOverflow.fade,
-                      softWrap: false,
                       style: TextStyle(
                         color: labelColor,
                         fontSize: fontSize,
-                        fontWeight: isDigit ? FontWeight.w800 : FontWeight.w900,
+                        fontWeight: FontWeight.w900,
                         height: 1,
+                        shadows: [
+                          if (isOperatorBtn)
+                            Shadow(
+                              color: Colors.black.withOpacity(0.16),
+                              blurRadius: 2,
+                              offset: const Offset(0, 1),
+                            ),
+                        ],
                       ),
                     ),
             ),
@@ -2423,144 +1677,118 @@ class _CalculatorPageState extends State<CalculatorPage> {
   Widget buttonRow(List<Widget> buttons) =>
       Expanded(child: Row(children: buttons));
 
-  List<Widget> normalButtons(double f) {
-    if (_normalButtonsCache != null &&
-        _normalButtonsScale == f &&
-        _normalButtonsDarkMode == widget.darkMode) {
-      return _normalButtonsCache!;
-    }
+  List<Widget> normalButtons(double f) => [
+    buttonRow([
+      premiumButton('C', dangerBtn, 20 * f),
+      premiumButton('⌫', dangerBtn, 20 * f),
+      premiumButton('%', opBtn, 20 * f),
+      premiumButton('÷', opBtn, 20 * f),
+    ]),
+    buttonRow([
+      premiumButton('√', opBtn, 20 * f),
+      premiumButton('x²', opBtn, 20 * f),
+      premiumButton('π', opBtn, 20 * f),
+      premiumButton('×', opBtn, 20 * f),
+    ]),
+    buttonRow([
+      premiumButton('7', numBtn, 21 * f),
+      premiumButton('8', numBtn, 21 * f),
+      premiumButton('9', numBtn, 21 * f),
+      premiumButton('-', opBtn, 21 * f),
+    ]),
+    buttonRow([
+      premiumButton('4', numBtn, 21 * f),
+      premiumButton('5', numBtn, 21 * f),
+      premiumButton('6', numBtn, 21 * f),
+      premiumButton('+', opBtn, 21 * f),
+    ]),
+    buttonRow([
+      premiumButton('1', numBtn, 21 * f),
+      premiumButton('2', numBtn, 21 * f),
+      premiumButton('3', numBtn, 21 * f),
+      premiumButton(')', opBtn, 21 * f),
+    ]),
+    buttonRow([
+      premiumButton('(', opBtn, 21 * f),
+      premiumButton('0', numBtn, 21 * f),
+      premiumButton('.', numBtn, 21 * f),
+      premiumButton('=', equalBtn, 21 * f),
+    ]),
+  ];
 
-    final buttons = <Widget>[
-      buttonRow([
-        premiumButton('C', dangerBtn, 20 * f),
-        premiumButton('⌫', dangerBtn, 20 * f),
-        premiumButton('%', opBtn, 20 * f),
-        premiumButton('÷', opBtn, 20 * f),
-      ]),
-      buttonRow([
-        premiumButton('√', opBtn, 20 * f),
-        premiumButton('x²', opBtn, 20 * f),
-        premiumButton('π', opBtn, 20 * f),
-        premiumButton('×', opBtn, 20 * f),
-      ]),
-      buttonRow([
-        premiumButton('7', numBtn, 21 * f),
-        premiumButton('8', numBtn, 21 * f),
-        premiumButton('9', numBtn, 21 * f),
-        premiumButton('-', opBtn, 21 * f),
-      ]),
-      buttonRow([
-        premiumButton('4', numBtn, 21 * f),
-        premiumButton('5', numBtn, 21 * f),
-        premiumButton('6', numBtn, 21 * f),
-        premiumButton('+', opBtn, 21 * f),
-      ]),
-      buttonRow([
-        premiumButton('1', numBtn, 21 * f),
-        premiumButton('2', numBtn, 21 * f),
-        premiumButton('3', numBtn, 21 * f),
-        premiumButton(')', opBtn, 21 * f),
-      ]),
-      buttonRow([
-        premiumButton('(', opBtn, 21 * f),
-        premiumButton('0', numBtn, 21 * f),
-        premiumButton('.', numBtn, 21 * f),
-        premiumButton('=', equalBtn, 21 * f),
-      ]),
-    ];
-
-    _normalButtonsScale = f;
-    _normalButtonsDarkMode = widget.darkMode;
-    _normalButtonsCache = buttons;
-    return buttons;
-  }
-
-  List<Widget> scientificButtons(double f) {
-    if (_scientificButtonsCache != null &&
-        _scientificButtonsScale == f &&
-        _scientificButtonsDarkMode == widget.darkMode) {
-      return _scientificButtonsCache!;
-    }
-
-    final buttons = <Widget>[
-      // Scientific layout inspired by iPhone scientific calculator: all scientific keys visible.
-      buttonRow([
-        premiumButton('(', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton(')', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('mc', sciBtn, 11 * f, scientificPanel: true),
-        premiumButton('m+', sciBtn, 11 * f, scientificPanel: true),
-        premiumButton('m-', sciBtn, 11 * f, scientificPanel: true),
-        premiumButton('mr', sciBtn, 11 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('2nd', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('x²', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('x³', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('xʸ', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('eˣ', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('10ˣ', sciBtn, 11.5 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('1/x', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('²√x', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('³√x', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('ʸ√x', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('ln', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('log₁₀', sciBtn, 10.5 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('x!', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('sin', sciBtn, 11.5 * f, scientificPanel: true),
-        premiumButton('cos', sciBtn, 11.5 * f, scientificPanel: true),
-        premiumButton('tan', sciBtn, 11.5 * f, scientificPanel: true),
-        premiumButton('e', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('EE', sciBtn, 11.5 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('Rand', sciBtn, 9.8 * f, scientificPanel: true),
-        premiumButton('sinh', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('cosh', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('tanh', sciBtn, 10.5 * f, scientificPanel: true),
-        premiumButton('π', sciBtn, 12 * f, scientificPanel: true),
-        premiumButton('Deg', sciBtn, 10.5 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('⌫', dangerBtn, 16 * f, scientificPanel: true),
-        premiumButton('AC', dangerBtn, 16 * f, scientificPanel: true),
-        premiumButton('%', sciBtn, 16 * f, scientificPanel: true),
-        premiumButton('÷', opBtn, 17 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('7', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('8', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('9', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('×', opBtn, 17 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('4', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('5', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('6', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('-', opBtn, 17 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('1', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('2', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('3', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('+', opBtn, 17 * f, scientificPanel: true),
-      ]),
-      buttonRow([
-        premiumButton('+/-', numBtn, 14 * f, scientificPanel: true),
-        premiumButton('0', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('.', numBtn, 17 * f, scientificPanel: true),
-        premiumButton('=', equalBtn, 17 * f, scientificPanel: true),
-      ]),
-    ];
-
-    _scientificButtonsScale = f;
-    _scientificButtonsDarkMode = widget.darkMode;
-    _scientificButtonsCache = buttons;
-    return buttons;
-  }
+  List<Widget> scientificButtons(double f) => [
+    // Scientific layout inspired by iPhone scientific calculator: all scientific keys visible.
+    buttonRow([
+      premiumButton('(', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton(')', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('mc', sciBtn, 11 * f, scientificPanel: true),
+      premiumButton('m+', sciBtn, 11 * f, scientificPanel: true),
+      premiumButton('m-', sciBtn, 11 * f, scientificPanel: true),
+      premiumButton('mr', sciBtn, 11 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('2nd', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('x²', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('x³', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('xʸ', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('eˣ', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('10ˣ', sciBtn, 11.5 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('1/x', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('²√x', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('³√x', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('ʸ√x', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('ln', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('log₁₀', sciBtn, 10.5 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('x!', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('sin', sciBtn, 11.5 * f, scientificPanel: true),
+      premiumButton('cos', sciBtn, 11.5 * f, scientificPanel: true),
+      premiumButton('tan', sciBtn, 11.5 * f, scientificPanel: true),
+      premiumButton('e', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('EE', sciBtn, 11.5 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('Rand', sciBtn, 9.8 * f, scientificPanel: true),
+      premiumButton('sinh', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('cosh', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('tanh', sciBtn, 10.5 * f, scientificPanel: true),
+      premiumButton('π', sciBtn, 12 * f, scientificPanel: true),
+      premiumButton('Deg', sciBtn, 10.5 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('⌫', dangerBtn, 16 * f, scientificPanel: true),
+      premiumButton('AC', dangerBtn, 16 * f, scientificPanel: true),
+      premiumButton('%', sciBtn, 16 * f, scientificPanel: true),
+      premiumButton('÷', opBtn, 17 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('7', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('8', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('9', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('×', opBtn, 17 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('4', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('5', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('6', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('-', opBtn, 17 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('1', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('2', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('3', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('+', opBtn, 17 * f, scientificPanel: true),
+    ]),
+    buttonRow([
+      premiumButton('+/-', numBtn, 14 * f, scientificPanel: true),
+      premiumButton('0', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('.', numBtn, 17 * f, scientificPanel: true),
+      premiumButton('=', equalBtn, 17 * f, scientificPanel: true),
+    ]),
+  ];
 
   Widget menuTile({
     required IconData icon,
@@ -2569,110 +1797,66 @@ class _CalculatorPageState extends State<CalculatorPage> {
     required List<Color> colors,
     required VoidCallback onTap,
   }) {
-    return Semantics(
-      button: true,
-      label: '$title. $subtitle',
-      child: PressScale(
-        borderRadius: BorderRadius.circular(22),
-        pressedScale: 0.965,
-        onTap: onTap,
-        child: Container(
-          height: 126,
-          padding: const EdgeInsets.all(13),
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: widget.darkMode
-                  ? [
-                      const Color(0xFF161A24),
-                      colors.last.withValues(alpha: 0.075),
-                    ]
-                  : [Colors.white, colors.last.withValues(alpha: 0.055)],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-            borderRadius: BorderRadius.circular(22),
-            border: Border.all(
-              color: colors.last.withValues(
-                alpha: widget.darkMode ? 0.18 : 0.12,
-              ),
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: Colors.black.withValues(
-                  alpha: widget.darkMode ? 0.14 : 0.045,
-                ),
-                blurRadius: 14,
-                offset: const Offset(0, 6),
-              ),
-            ],
+    return PressScale(
+      borderRadius: BorderRadius.circular(22),
+      pressedScale: 0.97,
+      onTap: onTap,
+      child: Container(
+        height: 118,
+        padding: const EdgeInsets.all(13),
+        decoration: BoxDecoration(
+          color: widget.darkMode
+              ? const Color(0xFF151517).withOpacity(0.70)
+              : Colors.white.withOpacity(0.72),
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(
+            color: widget.darkMode
+                ? Colors.white.withOpacity(0.08)
+                : Colors.black.withOpacity(0.05),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    height: 42,
-                    width: 42,
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: colors,
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                      ),
-                      borderRadius: BorderRadius.circular(15),
-                      boxShadow: [
-                        BoxShadow(
-                          color: colors.last.withValues(alpha: 0.24),
-                          blurRadius: 10,
-                          offset: const Offset(0, 5),
-                        ),
-                      ],
-                    ),
-                    child: Icon(icon, color: Colors.white, size: 22),
-                  ),
-                  const Spacer(),
-                  Container(
-                    height: 28,
-                    width: 28,
-                    decoration: BoxDecoration(
-                      color: colors.first.withValues(alpha: 0.10),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Icon(
-                      Icons.arrow_outward_rounded,
-                      color: colors.last,
-                      size: 15,
-                    ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              height: 42,
+              width: 42,
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: colors,
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [
+                  BoxShadow(
+                    color: colors.last.withOpacity(0.28),
+                    blurRadius: 12,
+                    offset: const Offset(0, 6),
                   ),
                 ],
               ),
-              const Spacer(),
-              Text(
-                title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: mainTextColor,
-                  fontSize: 15,
-                  fontWeight: FontWeight.w900,
-                  letterSpacing: -0.15,
-                ),
+              child: Icon(icon, color: Colors.white, size: 22),
+            ),
+            const Spacer(),
+            Text(
+              title,
+              style: TextStyle(
+                color: mainTextColor,
+                fontSize: 15,
+                fontWeight: FontWeight.w900,
               ),
-              const SizedBox(height: 3),
-              Text(
-                subtitle,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: mutedTextColor,
-                  fontSize: 11.5,
-                  height: 1.2,
-                  fontWeight: FontWeight.w600,
-                ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              subtitle,
+              style: TextStyle(
+                color: mutedTextColor,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
@@ -2776,7 +1960,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black.withValues(alpha: 0.45),
+      barrierColor: Colors.black.withOpacity(0.45),
       builder: (_) {
         return SafeArea(
           child: Padding(
@@ -2794,8 +1978,8 @@ class _CalculatorPageState extends State<CalculatorPage> {
                 borderRadius: BorderRadius.circular(28),
                 border: Border.all(
                   color: widget.darkMode
-                      ? Colors.white.withValues(alpha: 0.12)
-                      : Colors.white.withValues(alpha: 0.85),
+                      ? Colors.white.withOpacity(0.12)
+                      : Colors.white.withOpacity(0.85),
                 ),
               ),
               child: Column(
@@ -2807,7 +1991,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
                       height: 5,
                       width: 46,
                       decoration: BoxDecoration(
-                        color: mutedTextColor.withValues(alpha: 0.45),
+                        color: mutedTextColor.withOpacity(0.45),
                         borderRadius: BorderRadius.circular(20),
                       ),
                     ),
@@ -2923,7 +2107,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      barrierColor: Colors.black.withValues(alpha: 0.45),
+      barrierColor: Colors.black.withOpacity(0.45),
       builder: (_) {
         final screenHeight = MediaQuery.of(context).size.height;
         return FractionallySizedBox(
@@ -2951,20 +2135,20 @@ class _CalculatorPageState extends State<CalculatorPage> {
                       borderRadius: BorderRadius.circular(28),
                       border: Border.all(
                         color: widget.darkMode
-                            ? Colors.white.withValues(alpha: 0.12)
-                            : Colors.white.withValues(alpha: 0.85),
+                            ? Colors.white.withOpacity(0.12)
+                            : Colors.white.withOpacity(0.85),
                       ),
                       boxShadow: [
                         BoxShadow(
                           color: const Color(
                             0xFF00D4FF,
-                          ).withValues(alpha: widget.darkMode ? 0.13 : 0.06),
+                          ).withOpacity(widget.darkMode ? 0.13 : 0.06),
                           blurRadius: 28,
                           offset: const Offset(0, 10),
                         ),
                         BoxShadow(
-                          color: Colors.black.withValues(
-                            alpha: widget.darkMode ? 0.40 : 0.12,
+                          color: Colors.black.withOpacity(
+                            widget.darkMode ? 0.40 : 0.12,
                           ),
                           blurRadius: 30,
                           offset: const Offset(0, 14),
@@ -2978,7 +2162,7 @@ class _CalculatorPageState extends State<CalculatorPage> {
                           height: 5,
                           width: 46,
                           decoration: BoxDecoration(
-                            color: mutedTextColor.withValues(alpha: 0.45),
+                            color: mutedTextColor.withOpacity(0.45),
                             borderRadius: BorderRadius.circular(20),
                           ),
                         ),
@@ -3135,84 +2319,6 @@ class _CalculatorPageState extends State<CalculatorPage> {
                           ],
                         ),
                         const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: menuTile(
-                                icon: Icons.payments_rounded,
-                                title: 'Cash Counter',
-                                subtitle: 'BD notes & coins',
-                                colors: const [
-                                  Color(0xFF16A34A),
-                                  Color(0xFF15803D),
-                                ],
-                                onTap: () {
-                                  Navigator.pop(context);
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => CashCounterBdPage(
-                                        darkMode: widget.darkMode,
-                                        backToTools: true,
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: menuTile(
-                                icon: Icons.balance_rounded,
-                                title: 'Best Buy',
-                                subtitle: 'Compare unit price',
-                                colors: const [
-                                  Color(0xFF2563EB),
-                                  Color(0xFF1D4ED8),
-                                ],
-                                onTap: () {
-                                  Navigator.pop(context);
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => BestBuyComparePage(
-                                        darkMode: widget.darkMode,
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 10),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: menuTile(
-                                icon: Icons.groups_rounded,
-                                title: 'Smart Bill Split',
-                                subtitle: 'Discount • service • people',
-                                colors: const [
-                                  Color(0xFF0F766E),
-                                  Color(0xFF0D9488),
-                                ],
-                                onTap: () {
-                                  Navigator.pop(context);
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => BillSplitPage(
-                                        darkMode: widget.darkMode,
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                          ],
-                        ),
-                        const SizedBox(height: 10),
 
                         Row(
                           children: [
@@ -3242,8 +2348,8 @@ class _CalculatorPageState extends State<CalculatorPage> {
                             Expanded(
                               child: menuTile(
                                 icon: Icons.person_rounded,
-                                title: 'About & Updates',
-                                subtitle: 'Version • Developer',
+                                title: 'About',
+                                subtitle: 'Developer',
                                 colors: const [
                                   Color(0xFF22D3EE),
                                   Color(0xFF0E9FB3),
@@ -3279,15 +2385,13 @@ class _CalculatorPageState extends State<CalculatorPage> {
                             ),
                             decoration: BoxDecoration(
                               color: widget.darkMode
-                                  ? const Color(
-                                      0xFF151517,
-                                    ).withValues(alpha: 0.70)
-                                  : Colors.white.withValues(alpha: 0.70),
+                                  ? const Color(0xFF151517).withOpacity(0.70)
+                                  : Colors.white.withOpacity(0.70),
                               borderRadius: BorderRadius.circular(22),
                               border: Border.all(
                                 color: widget.darkMode
-                                    ? Colors.white.withValues(alpha: 0.08)
-                                    : Colors.black.withValues(alpha: 0.06),
+                                    ? Colors.white.withOpacity(0.08)
+                                    : Colors.black.withOpacity(0.06),
                               ),
                             ),
                             child: Row(
@@ -3347,171 +2451,213 @@ class _CalculatorPageState extends State<CalculatorPage> {
   }
 
   Widget topBar(double fontScale) {
-    final double screenWidth = MediaQuery.sizeOf(context).width;
-    final bool compact = screenWidth < 365;
-    final bool veryCompact = screenWidth < 335;
-
-    Widget iconButton({
-      required IconData icon,
-      required VoidCallback onTap,
-      Color? iconColor,
-      Color? background,
-      String? tooltip,
-    }) {
-      final double size = veryCompact ? 31 : (compact ? 33 : 36);
-      return Tooltip(
-        message: tooltip ?? '',
-        child: PressScale(
-          borderRadius: BorderRadius.circular(14),
-          onTap: onTap,
-          child: Container(
-            height: size,
-            width: size,
-            decoration: BoxDecoration(
-              color: background ?? card2,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: widget.darkMode
-                    ? Colors.white.withValues(alpha: 0.07)
-                    : Colors.black.withValues(alpha: 0.05),
-              ),
-            ),
-            child: Icon(
-              icon,
-              size: veryCompact ? 16 : 18,
-              color: iconColor ?? mainTextColor,
-            ),
-          ),
-        ),
-      );
-    }
-
     return Padding(
-      padding: EdgeInsets.fromLTRB(
-        compact ? 8 : 11,
-        compact ? 7 : 9,
-        compact ? 8 : 11,
-        6,
-      ),
+      padding: const EdgeInsets.fromLTRB(10, 6, 10, 4),
       child: Row(
         children: [
-          Container(
-            height: veryCompact ? 34 : 38,
-            width: veryCompact ? 34 : 38,
-            decoration: BoxDecoration(
-              color: const Color(0xFF2563EB),
-              borderRadius: BorderRadius.circular(15),
-            ),
-            child: const Icon(
-              Icons.calculate_rounded,
-              color: Colors.white,
-              size: 21,
+          PressScale(
+            borderRadius: BorderRadius.circular(20),
+            onTap: toggleScientificMode,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              height: 34,
+              width: 34,
+              decoration: BoxDecoration(
+                color: scientificMode ? equalBtn : card2,
+                shape: BoxShape.circle,
+                border: Border.all(color: Colors.white12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(
+                      widget.darkMode ? 0.28 : 0.10,
+                    ),
+                    blurRadius: 10,
+                    offset: const Offset(0, 5),
+                  ),
+                ],
+              ),
+              child: Icon(
+                scientificMode
+                    ? Icons.calculate_rounded
+                    : Icons.science_rounded,
+                size: 18,
+                color: scientificMode ? Colors.white : mainTextColor,
+              ),
             ),
           ),
-          SizedBox(width: compact ? 8 : 10),
+
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Row(
-                  children: [
-                    Flexible(
-                      child: Text(
-                        'HisabFlow',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: mainTextColor,
-                          fontSize:
-                              (veryCompact
-                                  ? 15
-                                  : compact
-                                  ? 16
-                                  : 18) *
-                              fontScale,
-                          fontWeight: FontWeight.w900,
-                          letterSpacing: -0.5,
-                        ),
-                      ),
+            child: Center(
+              child: PressScale(
+                borderRadius: BorderRadius.circular(999),
+                onTap: () {
+                  HapticFeedback.lightImpact();
+                  widget.onThemeChanged(!widget.darkMode);
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 260),
+                  curve: Curves.easeOutCubic,
+                  height: 34,
+                  width: 132,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(999),
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: widget.darkMode
+                          ? [
+                              const Color(0xFF5A6870).withOpacity(0.95),
+                              const Color(0xFF344149).withOpacity(0.95),
+                            ]
+                          : [Colors.white, const Color(0xFFE9EEF2)],
                     ),
-                  ],
-                ),
-                if (!compact)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 2),
-                    child: Row(
-                      children: [
-                        Container(
-                          height: 6,
-                          width: 6,
+                    border: Border.all(
+                      color: widget.darkMode
+                          ? Colors.white.withOpacity(0.16)
+                          : Colors.black.withOpacity(0.06),
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(
+                          widget.darkMode ? 0.30 : 0.12,
+                        ),
+                        blurRadius: 16,
+                        offset: const Offset(0, 7),
+                      ),
+                    ],
+                  ),
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      AnimatedAlign(
+                        duration: const Duration(milliseconds: 260),
+                        curve: Curves.easeOutCubic,
+                        alignment: widget.darkMode
+                            ? Alignment.centerRight
+                            : Alignment.centerLeft,
+                        child: Container(
+                          height: 26,
+                          width: 48,
                           decoration: BoxDecoration(
-                            color: firebaseUser == null
-                                ? const Color(0xFFFFA31A)
-                                : const Color(0xFF30C96B),
-                            shape: BoxShape.circle,
+                            color: widget.darkMode
+                                ? const Color(0xFF6A7780)
+                                : Colors.white,
+                            borderRadius: BorderRadius.circular(999),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withOpacity(0.18),
+                                blurRadius: 8,
+                                offset: const Offset(0, 3),
+                              ),
+                            ],
+                          ),
+                          child: Icon(
+                            widget.darkMode
+                                ? Icons.nightlight_round
+                                : Icons.wb_sunny_rounded,
+                            size: 17,
+                            color: widget.darkMode
+                                ? const Color(0xFFFFC857)
+                                : const Color(0xFFFFB000),
                           ),
                         ),
-                        const SizedBox(width: 5),
-                        Flexible(
+                      ),
+                      Align(
+                        alignment: widget.darkMode
+                            ? Alignment.centerLeft
+                            : Alignment.centerRight,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
                           child: Text(
-                            firebaseUser == null
-                                ? 'Offline-ready • Sign in for backup'
-                                : 'Cloud backup ready',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                            widget.darkMode ? 'Dark' : 'Light',
                             style: TextStyle(
-                              color: mutedTextColor,
-                              fontSize: 10 * fontScale,
-                              fontWeight: FontWeight.w700,
+                              color: widget.darkMode
+                                  ? Colors.white
+                                  : const Color(0xFF37474F),
+                              fontSize: 12 * fontScale,
+                              fontWeight: FontWeight.w900,
                             ),
                           ),
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
-              ],
+                ),
+              ),
             ),
           ),
-          const SizedBox(width: 5),
-          iconButton(
-            icon: scientificMode
-                ? Icons.calculate_rounded
-                : Icons.science_rounded,
-            onTap: toggleScientificMode,
-            iconColor: scientificMode ? Colors.white : mainTextColor,
-            background: scientificMode ? opBtn : card2,
-            tooltip: scientificMode ? 'Basic mode' : 'Scientific mode',
+
+          TextButton(
+            onPressed: toggleWordLanguage,
+            child: Text(
+              banglaWord ? 'EN' : 'বাংলা',
+              style: TextStyle(
+                color: opBtn,
+                fontSize: 12 * fontScale,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
           ),
-          const SizedBox(width: 5),
-          HisabFlowThemeToggle(
-            darkMode: widget.darkMode,
-            compact: compact,
-            onChanged: widget.onThemeChanged,
-          ),
-          const SizedBox(width: 5),
-          iconButton(
-            icon: firebaseUser == null
-                ? Icons.cloud_outlined
-                : Icons.cloud_done_rounded,
+
+          PressScale(
+            borderRadius: BorderRadius.circular(16),
             onTap: openCloudBackupSheet,
-            iconColor: firebaseUser == null
-                ? mainTextColor
-                : const Color(0xFF30C96B),
-            background: firebaseUser == null
-                ? card2
-                : const Color(0xFF30C96B).withValues(alpha: 0.12),
-            tooltip: 'Cloud backup',
+            child: Container(
+              height: 34,
+              width: 34,
+              margin: const EdgeInsets.only(right: 6),
+              decoration: BoxDecoration(
+                color: firebaseUser == null
+                    ? card2
+                    : const Color(0xFF0F9D58).withOpacity(0.28),
+                shape: BoxShape.circle,
+                border: Border.all(
+                  color: firebaseUser == null
+                      ? Colors.white12
+                      : Colors.greenAccent.withOpacity(0.35),
+                ),
+              ),
+              child: Icon(
+                firebaseUser == null
+                    ? Icons.person_outline_rounded
+                    : Icons.cloud_done_rounded,
+                size: 18,
+                color: firebaseUser == null
+                    ? mainTextColor
+                    : Colors.greenAccent,
+              ),
+            ),
           ),
-          const SizedBox(width: 5),
-          iconButton(
-            icon: Icons.grid_view_rounded,
+
+          PressScale(
+            borderRadius: BorderRadius.circular(18),
             onTap: openPremiumMenu,
-            iconColor: opBtn,
-            background: widget.darkMode
-                ? const Color(0xFF202327)
-                : Colors.white,
-            tooltip: 'More tools',
+            child: Container(
+              height: 38,
+              width: 38,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF3A3A3C), Color(0xFF1C1C1E)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(color: Colors.white.withOpacity(0.08)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.24),
+                    blurRadius: 10,
+                    offset: const Offset(0, 5),
+                  ),
+                ],
+              ),
+              child: const Icon(
+                Icons.auto_awesome_rounded,
+                color: Color(0xFFFF9F0A),
+                size: 21,
+              ),
+            ),
           ),
         ],
       ),
@@ -3519,123 +2665,75 @@ class _CalculatorPageState extends State<CalculatorPage> {
   }
 
   Widget displayBox(double h, double fontScale) {
-    final double displayHeight = (h * (scientificMode ? 0.122 : 0.158))
-        .clamp(scientificMode ? 88.0 : 112.0, scientificMode ? 120.0 : 154.0)
-        .toDouble();
-    final bool hasExpression = expression.trim().isNotEmpty;
-
-    return Container(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
       width: double.infinity,
-      height: displayHeight,
+      height: h * 0.145,
       margin: const EdgeInsets.symmetric(horizontal: 10),
-      padding: EdgeInsets.fromLTRB(
-        scientificMode ? 12 : 15,
-        scientificMode ? 8 : 11,
-        scientificMode ? 12 : 15,
-        scientificMode ? 8 : 10,
-      ),
+      padding: const EdgeInsets.fromLTRB(14, 10, 12, 10),
       decoration: BoxDecoration(
-        color: widget.darkMode ? const Color(0xFF111214) : Colors.white,
-        borderRadius: BorderRadius.circular(scientificMode ? 22 : 28),
-        border: Border.all(
-          color: widget.darkMode ? Colors.white10 : Colors.black12,
+        gradient: LinearGradient(
+          colors: widget.darkMode
+              ? [const Color(0xFF1C1C1E), const Color(0xFF111214)]
+              : [Colors.white, const Color(0xFFE8E8ED)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
         ),
+        borderRadius: BorderRadius.circular(26),
+        border: Border.all(
+          color: widget.darkMode
+              ? Colors.white.withOpacity(0.07)
+              : Colors.black.withOpacity(0.04),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(widget.darkMode ? 0.32 : 0.08),
+            blurRadius: 18,
+            offset: const Offset(0, 9),
+          ),
+        ],
       ),
       child: Column(
         children: [
-          Row(
-            children: [
-              Container(
-                padding: EdgeInsets.symmetric(
-                  horizontal: scientificMode ? 7 : 8,
-                  vertical: scientificMode ? 3 : 4,
-                ),
-                decoration: BoxDecoration(
-                  color: justCalculated
-                      ? const Color(0xFF30C96B).withValues(alpha: 0.12)
-                      : const Color(0xFF22D3EE).withValues(alpha: 0.10),
-                  borderRadius: BorderRadius.circular(99),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      height: 6,
-                      width: 6,
-                      decoration: BoxDecoration(
-                        color: justCalculated
-                            ? const Color(0xFF30C96B)
-                            : const Color(0xFF22D3EE),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 5),
-                    Text(
-                      justCalculated ? 'RESULT' : 'LIVE',
-                      style: TextStyle(
-                        color: justCalculated
-                            ? const Color(0xFF30C96B)
-                            : const Color(0xFF22D3EE),
-                        fontSize: (scientificMode ? 8 : 9) * fontScale,
-                        fontWeight: FontWeight.w900,
-                        letterSpacing: 0.7,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              const Spacer(),
-              if (miniHistory.isNotEmpty)
-                Flexible(
-                  child: Text(
-                    miniHistory.first,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.right,
-                    style: TextStyle(
-                      color: mutedTextColor.withValues(alpha: 0.65),
-                      fontSize: (scientificMode ? 8.2 : 9.2) * fontScale,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-            ],
-          ),
-          SizedBox(height: scientificMode ? 4 : 7),
           Expanded(
             child: Align(
               alignment: Alignment.centerRight,
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 reverse: true,
-                child: Text(
-                  hasExpression ? expression : 'Start calculating',
-                  style: TextStyle(
-                    color: hasExpression
-                        ? mutedTextColor
-                        : mutedTextColor.withValues(alpha: 0.55),
-                    fontSize: (scientificMode ? 12.5 : 15) * fontScale,
-                    fontWeight: FontWeight.w600,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: Text(
+                    expression.isEmpty ? '0' : expression,
+                    key: ValueKey(expression),
+                    style: TextStyle(
+                      color: mutedTextColor,
+                      fontSize: 15 * fontScale,
+                    ),
                   ),
                 ),
               ),
             ),
           ),
           Expanded(
-            flex: 2,
             child: Align(
               alignment: Alignment.centerRight,
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                alignment: Alignment.centerRight,
-                child: Text(
-                  result,
-                  style: TextStyle(
-                    fontSize: (scientificMode ? 33 : 45) * fontScale,
-                    fontWeight: FontWeight.w900,
-                    color: result == 'Error' ? Colors.redAccent : mainTextColor,
-                    letterSpacing: -1.3,
-                    height: 1,
+              child: AnimatedSwitcher(
+                duration: const Duration(milliseconds: 180),
+                transitionBuilder: (child, animation) => ScaleTransition(
+                  scale: animation,
+                  child: FadeTransition(opacity: animation, child: child),
+                ),
+                child: FittedBox(
+                  key: ValueKey(result),
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    result,
+                    style: TextStyle(
+                      fontSize: 40 * fontScale,
+                      fontWeight: FontWeight.w900,
+                      color: mainTextColor,
+                    ),
                   ),
                 ),
               ),
@@ -3646,174 +2744,91 @@ class _CalculatorPageState extends State<CalculatorPage> {
     );
   }
 
-  Widget wordBox(double h, double fontScale) {
-    final double boxHeight = (h * (scientificMode ? 0.050 : 0.060))
-        .clamp(scientificMode ? 35.0 : 43.0, scientificMode ? 43.0 : 52.0)
-        .toDouble();
-
-    return PressScale(
-      borderRadius: BorderRadius.circular(18),
-      pressedScale: 0.985,
-      onTap: toggleWordLanguage,
-      child: Container(
-        width: double.infinity,
-        height: boxHeight,
-        margin: EdgeInsets.fromLTRB(
-          10,
-          scientificMode ? 5 : 7,
-          10,
-          scientificMode ? 5 : 7,
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 12),
-        decoration: BoxDecoration(
-          color: card,
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: widget.darkMode
-                ? Colors.white.withValues(alpha: 0.055)
-                : Colors.black.withValues(alpha: 0.04),
-          ),
-        ),
-        child: Row(
-          children: [
-            Container(
-              height: scientificMode ? 25 : 29,
-              width: scientificMode ? 25 : 29,
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [
-                    const Color(0xFFFFA31A).withValues(alpha: 0.18),
-                    const Color(0xFFFF7A00).withValues(alpha: 0.10),
-                  ],
-                ),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: Icon(
-                Icons.translate_rounded,
-                size: scientificMode ? 14 : 16,
-                color: opBtn,
-              ),
-            ),
-            const SizedBox(width: 9),
-            Expanded(
-              child: Text(
-                wordText,
-                maxLines: scientificMode ? 1 : 2,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(
-                  color: mainTextColor,
-                  fontSize: (scientificMode ? 10.5 : 12.3) * fontScale,
-                  fontWeight: FontWeight.w700,
-                ),
-              ),
-            ),
-            const SizedBox(width: 7),
-            Container(
-              padding: EdgeInsets.symmetric(
-                horizontal: scientificMode ? 7 : 8,
-                vertical: scientificMode ? 4 : 5,
-              ),
-              decoration: BoxDecoration(
-                color: opBtn.withValues(alpha: 0.10),
-                borderRadius: BorderRadius.circular(99),
-              ),
-              child: Text(
-                banglaWord ? 'বাংলা' : 'EN',
-                style: TextStyle(
-                  color: opBtn,
-                  fontSize: (scientificMode ? 8.5 : 9.5) * fontScale,
-                  fontWeight: FontWeight.w900,
-                ),
-              ),
-            ),
-          ],
+  Widget wordBox(double h, double fontScale) => AnimatedContainer(
+    duration: const Duration(milliseconds: 220),
+    width: double.infinity,
+    height: scientificMode ? h * 0.065 : h * 0.075,
+    margin: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+    decoration: BoxDecoration(
+      color: card,
+      borderRadius: BorderRadius.circular(22),
+      border: Border.all(color: Colors.white.withOpacity(0.06)),
+    ),
+    alignment: Alignment.centerLeft,
+    child: AnimatedSwitcher(
+      duration: const Duration(milliseconds: 180),
+      child: Text(
+        wordText,
+        key: ValueKey(wordText),
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          color: opBtn,
+          fontSize: 13 * fontScale,
+          fontWeight: FontWeight.w600,
         ),
       ),
-    );
-  }
+    ),
+  );
 
   Widget smartActionDock(double fontScale) {
-    final Size screen = MediaQuery.sizeOf(context);
-    final bool tinyHeight = screen.height < 650;
-    final bool compactWidth = screen.width < 350;
-    final double primaryHeight = scientificMode
-        ? (tinyHeight ? 32.0 : 36.0)
-        : (tinyHeight ? 41.0 : 48.0);
-    final double secondaryHeight = scientificMode
-        ? (tinyHeight ? 27.0 : 30.0)
-        : (tinyHeight ? 31.0 : 35.0);
-
-    Widget mainAction({
+    Widget dockItem({
       required IconData icon,
       required String label,
-      required String subtitle,
       required List<Color> colors,
       required VoidCallback onTap,
-      int flex = 1,
-      Widget? trailing,
     }) {
-      return Expanded(
-        flex: flex,
+      return Padding(
+        padding: const EdgeInsets.only(right: 8),
         child: PressScale(
           borderRadius: BorderRadius.circular(18),
-          pressedScale: 0.965,
+          pressedScale: 0.96,
           onTap: onTap,
           child: Container(
-            height: primaryHeight,
-            padding: EdgeInsets.symmetric(
-              horizontal: scientificMode ? 8 : (compactWidth ? 9 : 11),
-            ),
+            height: scientificMode ? 34 : 40,
+            padding: EdgeInsets.symmetric(horizontal: scientificMode ? 10 : 12),
             decoration: BoxDecoration(
-              color: widget.darkMode ? const Color(0xFF17181B) : Colors.white,
+              color: widget.darkMode ? const Color(0xFF151517) : Colors.white,
               borderRadius: BorderRadius.circular(18),
-              border: Border.all(color: colors.first.withValues(alpha: 0.35)),
+              border: Border.all(
+                color: widget.darkMode
+                    ? Colors.white.withOpacity(0.08)
+                    : Colors.black.withOpacity(0.05),
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: colors.last.withOpacity(widget.darkMode ? 0.16 : 0.09),
+                  blurRadius: 12,
+                  offset: const Offset(0, 5),
+                ),
+              ],
             ),
             child: Row(
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
-                  height: scientificMode ? 24 : 31,
-                  width: scientificMode ? 24 : 31,
+                  height: scientificMode ? 24 : 27,
+                  width: scientificMode ? 24 : 27,
                   decoration: BoxDecoration(
-                    color: colors.first.withValues(alpha: 0.14),
+                    gradient: LinearGradient(colors: colors),
                     borderRadius: BorderRadius.circular(11),
                   ),
                   child: Icon(
                     icon,
-                    color: colors.first,
-                    size: scientificMode ? 14 : 18,
+                    color: Colors.white,
+                    size: scientificMode ? 14 : 15,
                   ),
                 ),
-                SizedBox(width: scientificMode ? 6 : 8),
-                Expanded(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: mainTextColor,
-                          fontSize: (scientificMode ? 10.2 : 12.6) * fontScale,
-                          fontWeight: FontWeight.w900,
-                        ),
-                      ),
-                      if (!scientificMode && !tinyHeight)
-                        Text(
-                          subtitle,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            color: mutedTextColor,
-                            fontSize: 8.5 * fontScale,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                    ],
+                SizedBox(width: scientificMode ? 5 : 7),
+                Text(
+                  label,
+                  style: TextStyle(
+                    color: mainTextColor,
+                    fontSize: (scientificMode ? 10.5 : 12) * fontScale,
+                    fontWeight: FontWeight.w900,
                   ),
                 ),
-                if (trailing != null) trailing,
               ],
             ),
           ),
@@ -3821,183 +2836,102 @@ class _CalculatorPageState extends State<CalculatorPage> {
       );
     }
 
-    Widget quickAction({
-      required IconData icon,
-      required String label,
-      required VoidCallback onTap,
-      Color? iconColor,
-    }) {
-      return Padding(
-        padding: const EdgeInsets.only(right: 7),
-        child: PressScale(
-          borderRadius: BorderRadius.circular(14),
-          onTap: onTap,
-          child: Container(
-            height: secondaryHeight,
-            padding: EdgeInsets.symmetric(horizontal: scientificMode ? 8 : 10),
-            decoration: BoxDecoration(
-              color: card,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: widget.darkMode
-                    ? Colors.white.withValues(alpha: 0.06)
-                    : Colors.black.withValues(alpha: 0.045),
+    Widget expenseButton() {
+      return PressScale(
+        borderRadius: BorderRadius.circular(18),
+        pressedScale: 0.97,
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => DailyExpensePage(
+                darkMode: widget.darkMode,
+                onDataChanged: AuthBackupService.scheduleAutoBackup,
               ),
             ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(
-                  icon,
-                  color: iconColor ?? opBtn,
-                  size: scientificMode ? 13 : 15,
-                ),
-                const SizedBox(width: 5),
-                Text(
-                  label,
-                  style: TextStyle(
-                    color: mainTextColor,
-                    fontSize: (scientificMode ? 9.1 : 10.5) * fontScale,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ],
+          );
+        },
+        child: Container(
+          height: scientificMode ? 34 : 40,
+          width: double.infinity,
+          decoration: BoxDecoration(
+            gradient: const LinearGradient(
+              colors: [Color(0xFF30C96B), Color(0xFF0F9D58)],
             ),
+            borderRadius: BorderRadius.circular(18),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF0F9D58).withOpacity(0.22),
+                blurRadius: 14,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.receipt_long_rounded,
+                color: Colors.white,
+                size: scientificMode ? 16 : 18,
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Daily Expense',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: (scientificMode ? 11 : 13) * fontScale,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
           ),
         ),
       );
     }
 
     return Container(
-      margin: EdgeInsets.fromLTRB(10, 0, 10, scientificMode ? 4 : 7),
+      height: scientificMode ? 80 : 94,
+      margin: EdgeInsets.fromLTRB(10, 0, 10, scientificMode ? 4 : 8),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
         children: [
-          Row(
-            children: [
-              mainAction(
-                icon: Icons.auto_awesome_rounded,
-                label: compactWidth ? 'Ask HisabFlow' : 'Ask HisabFlow',
-                subtitle: 'Assistant • Bangla • English',
-                colors: const [Color(0xFF8B5CF6), Color(0xFF5B46E8)],
-                flex: 3,
-                trailing: scientificMode
-                    ? null
-                    : Icon(
-                        Icons.arrow_forward_rounded,
-                        color: mainTextColor,
-                        size: 17,
-                      ),
-                onTap: () {
-                  HapticFeedback.selectionClick();
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (_) => const HisabFlowAiPage()),
-                  );
-                },
-              ),
-              const SizedBox(width: 8),
-              mainAction(
-                icon: Icons.receipt_long_rounded,
-                label: compactWidth ? 'Expense' : 'Daily Expense',
-                subtitle: 'Track money',
-                colors: const [Color(0xFF2AC96A), Color(0xFF0F9D58)],
-                flex: 2,
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => DailyExpensePage(
-                        darkMode: widget.darkMode,
-                        onDataChanged: AuthBackupService.scheduleAutoBackup,
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ],
-          ),
-          SizedBox(height: scientificMode ? 4 : 6),
           SizedBox(
-            height: secondaryHeight,
+            height: scientificMode ? 38 : 46,
             child: SingleChildScrollView(
               scrollDirection: Axis.horizontal,
               physics: const BouncingScrollPhysics(),
               child: Row(
                 children: [
-                  quickAction(
-                    icon: Icons.grid_view_rounded,
-                    label: 'Tools',
-                    onTap: openPremiumMenu,
-                    iconColor: const Color(0xFF22D3EE),
-                  ),
-                  quickAction(
-                    icon: Icons.payments_rounded,
-                    label: 'Cash',
-                    iconColor: const Color(0xFF16A34A),
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => CashCounterBdPage(
-                          darkMode: widget.darkMode,
-                          backToTools: true,
-                        ),
-                      ),
-                    ),
-                  ),
-                  quickAction(
-                    icon: Icons.balance_rounded,
-                    label: 'Compare',
-                    iconColor: const Color(0xFF2563EB),
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            BestBuyComparePage(darkMode: widget.darkMode),
-                      ),
-                    ),
-                  ),
-                  quickAction(
-                    icon: Icons.groups_rounded,
-                    label: 'Split',
-                    iconColor: const Color(0xFF0F766E),
-                    onTap: () => Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) =>
-                            BillSplitPage(darkMode: widget.darkMode),
-                      ),
-                    ),
-                  ),
-                  quickAction(
-                    icon: Icons.history_rounded,
-                    label: 'History',
-                    onTap: openHistory,
-                  ),
-                  quickAction(
-                    icon: Icons.save_rounded,
-                    label: 'Save',
-                    onTap: saveDialog,
-                  ),
-                  quickAction(
+                  dockItem(
                     icon: Icons.copy_rounded,
                     label: 'Copy',
+                    colors: const [Color(0xFFFFB143), Color(0xFFFF9500)],
                     onTap: copyResult,
                   ),
-                  quickAction(
+                  dockItem(
                     icon: Icons.share_rounded,
                     label: 'Share',
+                    colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)],
                     onTap: shareCalculatorResult,
                   ),
-                  quickAction(
+                  dockItem(
                     icon: Icons.picture_as_pdf_rounded,
                     label: 'PDF',
+                    colors: const [Color(0xFFFFA733), Color(0xFFFF7C00)],
                     onTap: exportCalculatorPdfDirect,
+                  ),
+                  dockItem(
+                    icon: Icons.save_rounded,
+                    label: 'Save',
+                    colors: const [Color(0xFF30C96B), Color(0xFF0F9D58)],
+                    onTap: saveDialog,
                   ),
                 ],
               ),
             ),
           ),
+          SizedBox(height: scientificMode ? 4 : 6),
+          expenseButton(),
         ],
       ),
     );
@@ -4010,56 +2944,58 @@ class _CalculatorPageState extends State<CalculatorPage> {
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final double w = constraints.maxWidth;
-            final double h = constraints.maxHeight;
-            final bool tablet = w >= 700;
-            final bool tinyHeight = h < 650;
-            final double calculatorWidth = tablet
-                ? (w * 0.62).clamp(430.0, 520.0).toDouble()
-                : w;
-            final double widthScale = (calculatorWidth / 390)
-                .clamp(0.80, 1.12)
+            final w = constraints.maxWidth;
+            final h = constraints.maxHeight;
+            final calculatorWidth = w > 700 ? 420.0 : w;
+            final fontScale = (calculatorWidth / 390)
+                .clamp(0.82, 1.04)
                 .toDouble();
-            final bool narrow = calculatorWidth < 350;
-            final double fontScale =
-                (widthScale * (narrow ? 0.95 : 1.0) * (tinyHeight ? 0.96 : 1.0))
-                    .clamp(0.78, 1.08)
-                    .toDouble();
-
-            return Container(
-              width: double.infinity,
-              height: double.infinity,
-              color: bg,
-              child: Center(
-                child: Container(
-                  width: calculatorWidth,
-                  height: h,
-                  decoration: BoxDecoration(
-                    color: bg,
-                    borderRadius: tablet ? BorderRadius.circular(28) : null,
-                    border: tablet
-                        ? Border.all(
-                            color: widget.darkMode
-                                ? Colors.white10
-                                : Colors.black12,
-                          )
-                        : null,
+            return Center(
+              child: Container(
+                width: calculatorWidth,
+                height: h,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: widget.darkMode
+                        ? [const Color(0xFF000000), const Color(0xFF070707)]
+                        : [const Color(0xFFF7F7F8), const Color(0xFFEDEDF2)],
+                    begin: Alignment.topCenter,
+                    end: Alignment.bottomCenter,
                   ),
-                  clipBehavior: tablet ? Clip.antiAlias : Clip.none,
-                  child: Column(
-                    children: [
-                      topBar(fontScale),
-                      displayBox(h, fontScale),
-                      wordBox(h, fontScale),
-                      smartActionDock(fontScale),
-                      Expanded(
-                        child: Padding(
-                          padding: EdgeInsets.fromLTRB(
-                            scientificMode ? 5 : 6,
-                            0,
-                            scientificMode ? 5 : 6,
-                            tinyHeight ? 4 : 7,
+                ),
+                child: Column(
+                  children: [
+                    topBar(fontScale),
+                    SizedBox(
+                      height: 22,
+                      child: Center(
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          child: Text(
+                            miniHistory.isEmpty ? '' : miniHistory.first,
+                            key: ValueKey(
+                              miniHistory.isEmpty ? '' : miniHistory.first,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: widget.darkMode
+                                  ? Colors.white38
+                                  : Colors.black38,
+                              fontSize: 11 * fontScale,
+                            ),
                           ),
+                        ),
+                      ),
+                    ),
+                    displayBox(h, fontScale),
+                    wordBox(h, fontScale),
+                    smartActionDock(fontScale),
+                    Expanded(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(6, 0, 6, 8),
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 240),
                           child: Column(
                             key: ValueKey(scientificMode),
                             children: scientificMode
@@ -4068,8 +3004,8 @@ class _CalculatorPageState extends State<CalculatorPage> {
                           ),
                         ),
                       ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
               ),
             );
@@ -4811,17 +3747,17 @@ class ToolsPage extends StatelessWidget {
             borderRadius: BorderRadius.circular(26),
             border: Border.all(
               color: darkMode
-                  ? Colors.white.withValues(alpha: 0.10)
-                  : Colors.white.withValues(alpha: 0.80),
+                  ? Colors.white.withOpacity(0.10)
+                  : Colors.white.withOpacity(0.80),
             ),
             boxShadow: [
               BoxShadow(
-                color: colors.last.withValues(alpha: darkMode ? 0.18 : 0.10),
+                color: colors.last.withOpacity(darkMode ? 0.18 : 0.10),
                 blurRadius: 18,
                 offset: const Offset(0, 8),
               ),
               BoxShadow(
-                color: Colors.black.withValues(alpha: darkMode ? 0.28 : 0.08),
+                color: Colors.black.withOpacity(darkMode ? 0.28 : 0.08),
                 blurRadius: 18,
                 offset: const Offset(0, 10),
               ),
@@ -4841,7 +3777,7 @@ class ToolsPage extends StatelessWidget {
                   borderRadius: BorderRadius.circular(22),
                   boxShadow: [
                     BoxShadow(
-                      color: colors.last.withValues(alpha: 0.32),
+                      color: colors.last.withOpacity(0.32),
                       blurRadius: 14,
                       offset: const Offset(0, 7),
                     ),
@@ -4924,45 +3860,6 @@ class ToolsPage extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: 14),
-                toolCard(
-                  context: context,
-                  icon: Icons.payments_rounded,
-                  title: 'Cash Counter BD',
-                  subtitle: 'Bank-style note count with Bangla / English',
-                  colors: const [Color(0xFF22C55E), Color(0xFF15803D)],
-                  onTap: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => CashCounterBdPage(darkMode: darkMode),
-                    ),
-                  ),
-                ),
-                toolCard(
-                  context: context,
-                  icon: Icons.balance_rounded,
-                  title: 'Best Buy Compare',
-                  subtitle: 'Compare unit price and choose the better deal',
-                  colors: const [Color(0xFF3B82F6), Color(0xFF1D4ED8)],
-                  onTap: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => BestBuyComparePage(darkMode: darkMode),
-                    ),
-                  ),
-                ),
-                toolCard(
-                  context: context,
-                  icon: Icons.groups_rounded,
-                  title: 'Smart Bill Split',
-                  subtitle: 'Split a bill quickly between people',
-                  colors: const [Color(0xFF14B8A6), Color(0xFF0F766E)],
-                  onTap: () => Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => BillSplitPage(darkMode: darkMode),
-                    ),
-                  ),
-                ),
                 toolCard(
                   context: context,
                   icon: Icons.history_rounded,
@@ -5161,8 +4058,8 @@ class _AgeCalculatorPageState extends ToolPageBase<AgeCalculatorPage> {
       borderRadius: BorderRadius.circular(26),
       border: Border.all(
         color: widget.darkMode
-            ? Colors.white.withValues(alpha: 0.12)
-            : Colors.white.withValues(alpha: 0.80),
+            ? Colors.white.withOpacity(0.12)
+            : Colors.white.withOpacity(0.80),
       ),
     ),
     child: child,
@@ -5513,21 +4410,17 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
         borderRadius: BorderRadius.circular(26),
         border: Border.all(
           color: widget.darkMode
-              ? Colors.white.withValues(alpha: 0.12)
-              : Colors.white.withValues(alpha: 0.80),
+              ? Colors.white.withOpacity(0.12)
+              : Colors.white.withOpacity(0.80),
         ),
         boxShadow: [
           BoxShadow(
-            color: statusColor().withValues(
-              alpha: widget.darkMode ? 0.08 : 0.05,
-            ),
+            color: statusColor().withOpacity(widget.darkMode ? 0.08 : 0.05),
             blurRadius: 24,
             offset: const Offset(0, 8),
           ),
           BoxShadow(
-            color: Colors.black.withValues(
-              alpha: widget.darkMode ? 0.28 : 0.08,
-            ),
+            color: Colors.black.withOpacity(widget.darkMode ? 0.28 : 0.08),
             blurRadius: 18,
             offset: const Offset(0, 10),
           ),
@@ -5616,11 +4509,9 @@ class _BMICalculatorPageState extends ToolPageBase<BMICalculatorPage> {
                     vertical: 7,
                   ),
                   decoration: BoxDecoration(
-                    color: statusColor().withValues(alpha: 0.16),
+                    color: statusColor().withOpacity(0.16),
                     borderRadius: BorderRadius.circular(18),
-                    border: Border.all(
-                      color: statusColor().withValues(alpha: 0.35),
-                    ),
+                    border: Border.all(color: statusColor().withOpacity(0.35)),
                   ),
                   child: Text(
                     bmiStatus,
@@ -5962,8 +4853,8 @@ class _DiscountCalculatorPageState
       borderRadius: BorderRadius.circular(26),
       border: Border.all(
         color: widget.darkMode
-            ? Colors.white.withValues(alpha: 0.12)
-            : Colors.white.withValues(alpha: 0.80),
+            ? Colors.white.withOpacity(0.12)
+            : Colors.white.withOpacity(0.80),
       ),
     ),
     child: child,
@@ -6271,7 +5162,7 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
                     width: 46,
                     height: 5,
                     decoration: BoxDecoration(
-                      color: mutedText.withValues(alpha: 0.35),
+                      color: mutedText.withOpacity(0.35),
                       borderRadius: BorderRadius.circular(99),
                     ),
                   ),
@@ -6584,8 +5475,8 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
               borderRadius: BorderRadius.circular(18),
               border: Border.all(
                 color: active
-                    ? Colors.cyanAccent.withValues(alpha: 0.25)
-                    : Colors.white.withValues(alpha: 0.08),
+                    ? Colors.cyanAccent.withOpacity(0.25)
+                    : Colors.white.withOpacity(0.08),
               ),
             ),
             child: Center(
@@ -6656,8 +5547,8 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
         borderRadius: BorderRadius.circular(24),
         border: Border.all(
           color: widget.darkMode
-              ? Colors.white.withValues(alpha: 0.10)
-              : Colors.white.withValues(alpha: 0.80),
+              ? Colors.white.withOpacity(0.10)
+              : Colors.white.withOpacity(0.80),
         ),
       ),
       child: Row(
@@ -6698,7 +5589,7 @@ class _SmartToolHistoryPageState extends State<SmartToolHistoryPage> {
                 Text(
                   formatDate(item.dateTime),
                   style: TextStyle(
-                    color: mutedText.withValues(alpha: 0.85),
+                    color: mutedText.withOpacity(0.85),
                     fontSize: 12,
                     fontWeight: FontWeight.bold,
                   ),
@@ -6995,21 +5886,17 @@ class _ProfitLossCalculatorPageState
         borderRadius: BorderRadius.circular(26),
         border: Border.all(
           color: widget.darkMode
-              ? Colors.white.withValues(alpha: 0.12)
-              : Colors.white.withValues(alpha: 0.80),
+              ? Colors.white.withOpacity(0.12)
+              : Colors.white.withOpacity(0.80),
         ),
         boxShadow: [
           BoxShadow(
-            color: statusColor().withValues(
-              alpha: widget.darkMode ? 0.08 : 0.05,
-            ),
+            color: statusColor().withOpacity(widget.darkMode ? 0.08 : 0.05),
             blurRadius: 24,
             offset: const Offset(0, 8),
           ),
           BoxShadow(
-            color: Colors.black.withValues(
-              alpha: widget.darkMode ? 0.30 : 0.10,
-            ),
+            color: Colors.black.withOpacity(widget.darkMode ? 0.30 : 0.10),
             blurRadius: 22,
             offset: const Offset(0, 12),
           ),
@@ -7134,7 +6021,7 @@ class _ProfitLossCalculatorPageState
           borderRadius: BorderRadius.circular(22),
           boxShadow: [
             BoxShadow(
-              color: const Color(0xFF0F9D58).withValues(alpha: 0.28),
+              color: const Color(0xFF0F9D58).withOpacity(0.28),
               blurRadius: 16,
               offset: const Offset(0, 8),
             ),
@@ -7281,7 +6168,7 @@ class _ProfitLossCalculatorPageState
                           color: statusColor(),
                           fontWeight: FontWeight.w900,
                         ),
-                        backgroundColor: statusColor().withValues(alpha: 0.16),
+                        backgroundColor: statusColor().withOpacity(0.16),
                       ),
                       const SizedBox(height: 10),
                       Text(
@@ -7517,21 +6404,19 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
         borderRadius: BorderRadius.circular(26),
         border: Border.all(
           color: widget.darkMode
-              ? Colors.white.withValues(alpha: 0.12)
-              : Colors.white.withValues(alpha: 0.80),
+              ? Colors.white.withOpacity(0.12)
+              : Colors.white.withOpacity(0.80),
         ),
         boxShadow: [
           BoxShadow(
             color: const Color(
               0xFF22D3EE,
-            ).withValues(alpha: widget.darkMode ? 0.08 : 0.05),
+            ).withOpacity(widget.darkMode ? 0.08 : 0.05),
             blurRadius: 24,
             offset: const Offset(0, 8),
           ),
           BoxShadow(
-            color: Colors.black.withValues(
-              alpha: widget.darkMode ? 0.30 : 0.10,
-            ),
+            color: Colors.black.withOpacity(widget.darkMode ? 0.30 : 0.10),
             blurRadius: 22,
             offset: const Offset(0, 12),
           ),
@@ -7653,7 +6538,7 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
           borderRadius: BorderRadius.circular(22),
           boxShadow: [
             BoxShadow(
-              color: const Color(0xFF0E9FB3).withValues(alpha: 0.28),
+              color: const Color(0xFF0E9FB3).withOpacity(0.28),
               blurRadius: 16,
               offset: const Offset(0, 8),
             ),
@@ -7699,7 +6584,7 @@ class _EMILoanCalculatorPageState extends ToolPageBase<EMILoanCalculatorPage> {
               borderRadius: BorderRadius.circular(22),
               boxShadow: [
                 BoxShadow(
-                  color: colors.last.withValues(alpha: 0.25),
+                  color: colors.last.withOpacity(0.25),
                   blurRadius: 14,
                   offset: const Offset(0, 7),
                 ),
@@ -7892,7 +6777,7 @@ class AboutDeveloperPage extends StatelessWidget {
   static const String developerName = 'Masum';
   static const String appName = 'HisabFlow';
   static const String whatsappNumber = '8801820806464';
-  static const String emailAddress = 'masumtech.dev@gmail.com';
+  static const String emailAddress = 'farabi13577@gmail.com';
   static const String portfolioUrl =
       'https://masumtechdev.github.io/portfolio/';
 
@@ -7913,15 +6798,8 @@ class AboutDeveloperPage extends StatelessWidget {
 
   void openWhatsApp() {
     openUrl(
-      'https://wa.me/$whatsappNumber?text=Hello%20Masum,%20I%20am%20using%20HisabFlow.',
+      'https://wa.me/$whatsappNumber?text=Hello%20Masum,%20I%20am%20using%20Masum%20Smart%20Calculator%20Pro.',
     );
-  }
-
-  void openWelcomeSupportRegistration() {
-    final message = Uri.encodeComponent(
-      'Assalamu Alaikum. I installed HisabFlow and would like free setup/support and important update information. You may contact me on this WhatsApp number about HisabFlow support.',
-    );
-    openUrl('https://wa.me/$whatsappNumber?text=$message');
   }
 
   void openEmail() {
@@ -8038,17 +6916,17 @@ class AboutDeveloperPage extends StatelessWidget {
         borderRadius: BorderRadius.circular(28),
         border: Border.all(
           color: darkMode
-              ? Colors.white.withValues(alpha: 0.12)
-              : Colors.white.withValues(alpha: 0.85),
+              ? Colors.white.withOpacity(0.12)
+              : Colors.white.withOpacity(0.85),
         ),
         boxShadow: [
           BoxShadow(
-            color: colors.last.withValues(alpha: darkMode ? 0.16 : 0.08),
+            color: colors.last.withOpacity(darkMode ? 0.16 : 0.08),
             blurRadius: 28,
             offset: const Offset(0, 10),
           ),
           BoxShadow(
-            color: Colors.black.withValues(alpha: darkMode ? 0.30 : 0.10),
+            color: Colors.black.withOpacity(darkMode ? 0.30 : 0.10),
             blurRadius: 22,
             offset: const Offset(0, 12),
           ),
@@ -8072,7 +6950,7 @@ class AboutDeveloperPage extends StatelessWidget {
               width: 140,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: const Color(0xFF22D3EE).withValues(alpha: 0.18),
+                color: const Color(0xFF22D3EE).withOpacity(0.18),
               ),
             ),
           ),
@@ -8084,7 +6962,7 @@ class AboutDeveloperPage extends StatelessWidget {
               width: 135,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: const Color(0xFF9A6BFF).withValues(alpha: 0.16),
+                color: const Color(0xFF9A6BFF).withOpacity(0.16),
               ),
             ),
           ),
@@ -8098,10 +6976,10 @@ class AboutDeveloperPage extends StatelessWidget {
                     vertical: 7,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF30C96B).withValues(alpha: 0.16),
+                    color: const Color(0xFF30C96B).withOpacity(0.16),
                     borderRadius: BorderRadius.circular(18),
                     border: Border.all(
-                      color: const Color(0xFF30C96B).withValues(alpha: 0.35),
+                      color: const Color(0xFF30C96B).withOpacity(0.35),
                     ),
                   ),
                   child: const Row(
@@ -8137,7 +7015,7 @@ class AboutDeveloperPage extends StatelessWidget {
                     shape: BoxShape.circle,
                     boxShadow: [
                       BoxShadow(
-                        color: const Color(0xFF7C4DFF).withValues(alpha: 0.36),
+                        color: const Color(0xFF7C4DFF).withOpacity(0.36),
                         blurRadius: 28,
                         offset: const Offset(0, 12),
                       ),
@@ -8198,11 +7076,11 @@ class AboutDeveloperPage extends StatelessWidget {
                   ),
                   decoration: BoxDecoration(
                     color: darkMode
-                        ? const Color(0xFF151517).withValues(alpha: 0.72)
-                        : Colors.white.withValues(alpha: 0.72),
+                        ? const Color(0xFF151517).withOpacity(0.72)
+                        : Colors.white.withOpacity(0.72),
                     borderRadius: BorderRadius.circular(18),
                     border: Border.all(
-                      color: Colors.cyanAccent.withValues(alpha: 0.18),
+                      color: Colors.cyanAccent.withOpacity(0.18),
                     ),
                   ),
                   child: const Text(
@@ -8275,61 +7153,30 @@ class AboutDeveloperPage extends StatelessWidget {
     );
   }
 
-  Widget dynamicVersionInfoRow() {
-    return FutureBuilder<PackageInfo>(
-      future: HisabFlowUpdateService.packageInfo(),
-      builder: (context, snapshot) {
-        final PackageInfo? info = snapshot.data;
-
-        final String value = info == null
-            ? 'Loading version information...'
-            : 'Version ${info.version}\n'
-                  'Build ${info.buildNumber}\n'
-                  '${info.packageName}';
-
-        return infoRow(Icons.verified_rounded, 'Version', value, const [
-          Color(0xFF30C96B),
-          Color(0xFF0F9D58),
-        ]);
-      },
-    );
-  }
-
   Widget quickStats() {
-    return FutureBuilder<PackageInfo>(
-      future: HisabFlowUpdateService.packageInfo(),
-      builder: (context, snapshot) {
-        final String buildNumber = snapshot.data?.buildNumber ?? '...';
-
-        return Row(
-          children: [
-            Expanded(
-              child: statBox('Tools', '12+', Icons.apps_rounded, const [
-                Color(0xFF22D3EE),
-                Color(0xFF0E9FB3),
-              ]),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: statBox(
-                'Mode',
-                'Pro',
-                Icons.workspace_premium_rounded,
-                const [Color(0xFFFFA733), Color(0xFFFF7C00)],
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: statBox(
-                'Build',
-                buildNumber,
-                Icons.rocket_launch_rounded,
-                const [Color(0xFF9A6BFF), Color(0xFF6A3DFF)],
-              ),
-            ),
-          ],
-        );
-      },
+    return Row(
+      children: [
+        Expanded(
+          child: statBox('Tools', '12+', Icons.apps_rounded, const [
+            Color(0xFF22D3EE),
+            Color(0xFF0E9FB3),
+          ]),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: statBox('Mode', 'Pro', Icons.workspace_premium_rounded, const [
+            Color(0xFFFFA733),
+            Color(0xFFFF7C00),
+          ]),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: statBox('Build', '36.3', Icons.rocket_launch_rounded, const [
+            Color(0xFF9A6BFF),
+            Color(0xFF6A3DFF),
+          ]),
+        ),
+      ],
     );
   }
 
@@ -8346,12 +7193,12 @@ class AboutDeveloperPage extends StatelessWidget {
         borderRadius: BorderRadius.circular(22),
         border: Border.all(
           color: darkMode
-              ? Colors.white.withValues(alpha: 0.08)
-              : Colors.black.withValues(alpha: 0.05),
+              ? Colors.white.withOpacity(0.08)
+              : Colors.black.withOpacity(0.05),
         ),
         boxShadow: [
           BoxShadow(
-            color: colors.last.withValues(alpha: darkMode ? 0.12 : 0.07),
+            color: colors.last.withOpacity(darkMode ? 0.12 : 0.07),
             blurRadius: 14,
             offset: const Offset(0, 7),
           ),
@@ -8412,14 +7259,14 @@ class AboutDeveloperPage extends StatelessWidget {
             borderRadius: BorderRadius.circular(25),
             border: Border.all(
               color: featured
-                  ? Colors.white.withValues(alpha: 0.18)
+                  ? Colors.white.withOpacity(0.18)
                   : darkMode
-                  ? Colors.white.withValues(alpha: 0.08)
-                  : Colors.black.withValues(alpha: 0.05),
+                  ? Colors.white.withOpacity(0.08)
+                  : Colors.black.withOpacity(0.05),
             ),
             boxShadow: [
               BoxShadow(
-                color: colors.last.withValues(alpha: darkMode ? 0.18 : 0.09),
+                color: colors.last.withOpacity(darkMode ? 0.18 : 0.09),
                 blurRadius: 18,
                 offset: const Offset(0, 9),
               ),
@@ -8431,7 +7278,7 @@ class AboutDeveloperPage extends StatelessWidget {
                 height: 54,
                 width: 54,
                 decoration: BoxDecoration(
-                  color: featured ? Colors.white.withValues(alpha: 0.17) : null,
+                  color: featured ? Colors.white.withOpacity(0.17) : null,
                   gradient: featured
                       ? null
                       : LinearGradient(
@@ -8442,7 +7289,7 @@ class AboutDeveloperPage extends StatelessWidget {
                   borderRadius: BorderRadius.circular(20),
                   boxShadow: [
                     BoxShadow(
-                      color: colors.last.withValues(alpha: 0.28),
+                      color: colors.last.withOpacity(0.28),
                       blurRadius: 12,
                       offset: const Offset(0, 6),
                     ),
@@ -8468,7 +7315,7 @@ class AboutDeveloperPage extends StatelessWidget {
                       subtitle,
                       style: TextStyle(
                         color: featured
-                            ? Colors.white.withValues(alpha: 0.82)
+                            ? Colors.white.withOpacity(0.82)
                             : mutedText,
                         fontSize: 12,
                         height: 1.25,
@@ -8497,7 +7344,7 @@ class AboutDeveloperPage extends StatelessWidget {
       decoration: BoxDecoration(
         color: card2,
         borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.07)),
+        border: Border.all(color: Colors.white.withOpacity(0.07)),
       ),
       child: Column(
         children: [
@@ -8511,7 +7358,7 @@ class AboutDeveloperPage extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(
-            'Made for daily calculation, smart records and small business support. Updates, Portfolio, WhatsApp and Feedback are connected.',
+            'Made for daily calculation, smart records and small business support. Portfolio, WhatsApp and Feedback are connected.',
             textAlign: TextAlign.center,
             style: TextStyle(
               color: mutedText,
@@ -8578,7 +7425,12 @@ class AboutDeveloperPage extends StatelessWidget {
                           const [Color(0xFF00C9FF), Color(0xFF0072FF)],
                         ),
                         const SizedBox(height: 16),
-                        dynamicVersionInfoRow(),
+                        infoRow(
+                          Icons.verified_rounded,
+                          'Version',
+                          'Version 1.0.0\nBuild 36.3\nPremium Edition',
+                          const [Color(0xFF30C96B), Color(0xFF0F9D58)],
+                        ),
                         const SizedBox(height: 16),
                         infoRow(
                           Icons.favorite_rounded,
@@ -8599,35 +7451,6 @@ class AboutDeveloperPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 14),
                 AnimatedFadeSlide(
-                  delayMs: 220,
-                  child: contactButton(
-                    icon: Icons.system_update_alt_rounded,
-                    title: 'Check for Updates',
-                    subtitle:
-                        'Check the latest HisabFlow version from Google Play',
-                    colors: const [Color(0xFF8B5CF6), Color(0xFF5B46E8)],
-                    onTap: () {
-                      HisabFlowUpdateService.checkForUpdates(
-                        context,
-                        manual: true,
-                      );
-                    },
-                    featured: true,
-                  ),
-                ),
-                AnimatedFadeSlide(
-                  delayMs: 240,
-                  child: contactButton(
-                    icon: Icons.auto_awesome_rounded,
-                    title: 'What’s New',
-                    subtitle: 'See the improvements included in this version',
-                    colors: const [Color(0xFF22D3EE), Color(0xFF0E9FB3)],
-                    onTap: () {
-                      HisabFlowUpdateService.showCurrentWhatsNew(context);
-                    },
-                  ),
-                ),
-                AnimatedFadeSlide(
                   delayMs: 240,
                   child: contactButton(
                     icon: Icons.public_rounded,
@@ -8636,17 +7459,6 @@ class AboutDeveloperPage extends StatelessWidget {
                     colors: const [Color(0xFF00C9FF), Color(0xFF0072FF)],
                     onTap: openPortfolio,
                     featured: true,
-                  ),
-                ),
-                AnimatedFadeSlide(
-                  delayMs: 300,
-                  child: contactButton(
-                    icon: Icons.volunteer_activism_rounded,
-                    title: 'Free Setup & Welcome Support',
-                    subtitle:
-                        'Optional: message us if you want support or a welcome call',
-                    colors: const [Color(0xFF22C55E), Color(0xFF15803D)],
-                    onTap: openWelcomeSupportRegistration,
                   ),
                 ),
                 AnimatedFadeSlide(
@@ -10536,7 +9348,7 @@ class _BusinessNotebookPageState extends State<BusinessNotebookPage> {
             child: Column(
               children: [
                 DropdownButtonFormField<String>(
-                  initialValue: type,
+                  value: type,
                   items: const [
                     DropdownMenuItem(value: 'Income', child: Text('Income')),
                     DropdownMenuItem(value: 'Expense', child: Text('Expense')),
@@ -11551,7 +10363,7 @@ class _UnitConverterPageState extends State<UnitConverterPage> {
       decoration: BoxDecoration(
         color: card,
         borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
@@ -11943,907 +10755,6 @@ class Parser {
     }
     if (start == i) throw Exception('Invalid number');
     return double.parse(text.substring(start, i));
-  }
-}
-
-// =============================================================================
-// HISABFLOW PRACTICAL QUICK TOOLS
-// =============================================================================
-
-class CashCounterBdPage extends StatefulWidget {
-  final bool darkMode;
-  final bool backToTools;
-
-  const CashCounterBdPage({
-    super.key,
-    required this.darkMode,
-    this.backToTools = false,
-  });
-
-  @override
-  State<CashCounterBdPage> createState() => _CashCounterBdPageState();
-}
-
-class _CashCounterBdPageState extends State<CashCounterBdPage> {
-  static const List<int> _denominations = <int>[
-    1000,
-    500,
-    200,
-    100,
-    50,
-    20,
-    10,
-    5,
-    2,
-    1,
-  ];
-
-  late final Map<int, TextEditingController> _controllers = {
-    for (final value in _denominations) value: TextEditingController(),
-  };
-
-  bool _bangla = false;
-  bool _languageLoaded = false;
-
-  Color get bg =>
-      widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F4F5);
-  Color get card => widget.darkMode ? const Color(0xFF151517) : Colors.white;
-  Color get field =>
-      widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF2F2F7);
-  Color get text => widget.darkMode ? Colors.white : const Color(0xFF111111);
-  Color get muted =>
-      widget.darkMode ? const Color(0xFF9A9AA1) : const Color(0xFF62626A);
-
-  String t(String en, String bn) => _bangla ? bn : en;
-
-  int get totalAmount => _denominations.fold<int>(0, (sum, value) {
-    final count = int.tryParse(_controllers[value]!.text.trim()) ?? 0;
-    return sum + (value * count);
-  });
-
-  @override
-  void initState() {
-    super.initState();
-    _loadLanguage();
-  }
-
-  Future<void> _loadLanguage() async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('cash_counter_language') ?? 'en';
-    if (!mounted) return;
-    setState(() {
-      _bangla = saved == 'bn';
-      _languageLoaded = true;
-    });
-  }
-
-  Future<void> _setLanguage(bool bangla) async {
-    setState(() => _bangla = bangla);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('cash_counter_language', bangla ? 'bn' : 'en');
-  }
-
-  @override
-  void dispose() {
-    for (final controller in _controllers.values) {
-      controller.dispose();
-    }
-    super.dispose();
-  }
-
-  String _formatBdAmount(int value) {
-    final s = value.abs().toString();
-    if (s.length <= 3) return '${value < 0 ? '-' : ''}$s';
-    final last3 = s.substring(s.length - 3);
-    var leading = s.substring(0, s.length - 3);
-    final groups = <String>[];
-    while (leading.length > 2) {
-      groups.insert(0, leading.substring(leading.length - 2));
-      leading = leading.substring(0, leading.length - 2);
-    }
-    if (leading.isNotEmpty) groups.insert(0, leading);
-    final result = '${groups.join(',')},$last3';
-    return value < 0 ? '-$result' : result;
-  }
-
-  String get _amountInWords {
-    if (totalAmount <= 0) {
-      return _bangla ? 'শূন্য টাকা মাত্র' : 'Zero Taka Only';
-    }
-    return _bangla
-        ? '${numberToBanglaWords(totalAmount)} টাকা মাত্র'
-        : '${numberToEnglishWords(totalAmount)} Taka Only';
-  }
-
-  void _clear() {
-    for (final controller in _controllers.values) {
-      controller.clear();
-    }
-    setState(() {});
-  }
-
-  void _goBack() {
-    if (widget.backToTools) {
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (_) => ToolsPage(darkMode: widget.darkMode)),
-      );
-      return;
-    }
-    Navigator.pop(context);
-  }
-
-  String _summaryText() {
-    final lines = <String>[
-      t('HisabFlow Cash Counter', 'HisabFlow ক্যাশ কাউন্টার'),
-      '',
-    ];
-
-    for (final value in _denominations) {
-      final count = int.tryParse(_controllers[value]!.text.trim()) ?? 0;
-      if (count > 0) {
-        final amount = value * count;
-        lines.add(
-          _bangla
-              ? '৳$value × $count = ৳${_formatBdAmount(amount)}'
-              : '৳$value × $count = ৳${_formatBdAmount(amount)}',
-        );
-      }
-    }
-
-    lines.add('');
-    lines.add(
-      _bangla
-          ? 'মোট টাকা: ৳${_formatBdAmount(totalAmount)}'
-          : 'Total Amount: ৳${_formatBdAmount(totalAmount)}',
-    );
-    lines.add(_amountInWords);
-    return lines.join('\n');
-  }
-
-  Future<void> _copy() async {
-    await Clipboard.setData(ClipboardData(text: _summaryText()));
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(t('Cash summary copied', 'ক্যাশ সারাংশ কপি হয়েছে')),
-      ),
-    );
-  }
-
-  Future<void> _share() async {
-    if (totalAmount <= 0) return;
-    final encoded = Uri.encodeComponent(_summaryText());
-    await openExternalUrl('https://wa.me/?text=$encoded');
-  }
-
-  Future<void> _showBankSlip() async {
-    final slipText = _summaryText();
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        backgroundColor: card,
-        title: Text(
-          t('Bank Slip Summary', 'ব্যাংক স্লিপ সারাংশ'),
-          style: TextStyle(color: text, fontWeight: FontWeight.w900),
-        ),
-        content: SingleChildScrollView(
-          child: SelectableText(
-            slipText,
-            style: TextStyle(
-              color: text,
-              height: 1.55,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: Text(t('Close', 'বন্ধ')),
-          ),
-          FilledButton.icon(
-            onPressed: () async {
-              await Clipboard.setData(ClipboardData(text: slipText));
-              if (dialogContext.mounted) Navigator.pop(dialogContext);
-              if (!mounted) return;
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                    t('Bank slip copied', 'ব্যাংক স্লিপ কপি হয়েছে'),
-                  ),
-                ),
-              );
-            },
-            icon: const Icon(Icons.copy_rounded),
-            label: Text(t('Copy', 'কপি')),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _languageToggle() {
-    Widget chip({
-      required String label,
-      required bool selected,
-      required VoidCallback onTap,
-    }) {
-      return Expanded(
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(14),
-          child: AnimatedContainer(
-            duration: const Duration(milliseconds: 180),
-            padding: const EdgeInsets.symmetric(vertical: 11),
-            decoration: BoxDecoration(
-              color: selected ? const Color(0xFF2563EB) : field,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: selected ? const Color(0xFF60A5FA) : Colors.transparent,
-              ),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              label,
-              style: TextStyle(
-                color: selected ? Colors.white : text,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Container(
-      padding: const EdgeInsets.all(5),
-      decoration: BoxDecoration(
-        color: card,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(
-          color: widget.darkMode ? Colors.white10 : Colors.black12,
-        ),
-      ),
-      child: Row(
-        children: [
-          chip(
-            label: 'English',
-            selected: !_bangla,
-            onTap: () => _setLanguage(false),
-          ),
-          const SizedBox(width: 6),
-          chip(
-            label: 'বাংলা',
-            selected: _bangla,
-            onTap: () => _setLanguage(true),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _denominationRow(int value) {
-    final controller = _controllers[value]!;
-    final count = int.tryParse(controller.text.trim()) ?? 0;
-    final amount = value * count;
-
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-      decoration: BoxDecoration(
-        color: card,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(
-          color: widget.darkMode ? Colors.white10 : Colors.black12,
-        ),
-      ),
-      child: Row(
-        children: [
-          Container(
-            width: 74,
-            padding: const EdgeInsets.symmetric(vertical: 12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF16A34A).withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            alignment: Alignment.center,
-            child: Text(
-              '৳$value',
-              style: const TextStyle(
-                color: Color(0xFF22C55E),
-                fontSize: 17,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                TextField(
-                  controller: controller,
-                  keyboardType: TextInputType.number,
-                  textInputAction: value == _denominations.last
-                      ? TextInputAction.done
-                      : TextInputAction.next,
-                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                  onChanged: (_) => setState(() {}),
-                  style: TextStyle(
-                    color: text,
-                    fontWeight: FontWeight.w900,
-                    fontSize: 17,
-                  ),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    filled: true,
-                    fillColor: field,
-                    hintText: t('Quantity', 'পরিমাণ'),
-                    hintStyle: TextStyle(
-                      color: muted,
-                      fontWeight: FontWeight.w700,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 13,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide.none,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 7),
-                Text(
-                  t(
-                    'Amount: ৳${_formatBdAmount(amount)}',
-                    'টাকার পরিমাণ: ৳${_formatBdAmount(amount)}',
-                  ),
-                  style: TextStyle(
-                    color: amount > 0 ? const Color(0xFF22C55E) : muted,
-                    fontWeight: FontWeight.w800,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    if (!_languageLoaded) {
-      return Scaffold(backgroundColor: bg, body: const SizedBox.shrink());
-    }
-
-    return PopScope(
-      canPop: !widget.backToTools,
-      onPopInvokedWithResult: (didPop, result) {
-        if (!didPop && widget.backToTools) _goBack();
-      },
-      child: Scaffold(
-        backgroundColor: bg,
-        appBar: AppBar(
-          backgroundColor: bg,
-          foregroundColor: text,
-          leading: IconButton(
-            onPressed: _goBack,
-            icon: const Icon(Icons.arrow_back_rounded),
-          ),
-          title: Text(t('Cash Counter BD', 'ক্যাশ কাউন্টার বিডি')),
-          actions: [
-            IconButton(
-              tooltip: t('Clear all', 'সব মুছুন'),
-              onPressed: _clear,
-              icon: const Icon(Icons.restart_alt_rounded),
-            ),
-          ],
-        ),
-        body: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 620),
-            child: ListView(
-              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
-              padding: const EdgeInsets.fromLTRB(14, 8, 14, 28),
-              children: [
-                _languageToggle(),
-                const SizedBox(height: 12),
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: card,
-                    borderRadius: BorderRadius.circular(22),
-                    border: Border.all(
-                      color: widget.darkMode ? Colors.white10 : Colors.black12,
-                    ),
-                  ),
-                  child: Row(
-                    children: [
-                      Container(
-                        height: 48,
-                        width: 48,
-                        decoration: BoxDecoration(
-                          color: const Color(
-                            0xFF16A34A,
-                          ).withValues(alpha: 0.14),
-                          borderRadius: BorderRadius.circular(16),
-                        ),
-                        child: const Icon(
-                          Icons.account_balance_wallet_rounded,
-                          color: Color(0xFF22C55E),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              t(
-                                'Bank-style cash count',
-                                'ব্যাংক স্লিপের মতো ক্যাশ হিসাব',
-                              ),
-                              style: TextStyle(
-                                color: text,
-                                fontWeight: FontWeight.w900,
-                                fontSize: 17,
-                              ),
-                            ),
-                            const SizedBox(height: 3),
-                            Text(
-                              t(
-                                'Enter quantity. Amount updates automatically.',
-                                'পরিমাণ লিখুন। টাকার হিসাব নিজে থেকেই হবে।',
-                              ),
-                              style: TextStyle(
-                                color: muted,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                ..._denominations.map(_denominationRow),
-                const SizedBox(height: 4),
-                Container(
-                  padding: const EdgeInsets.all(18),
-                  decoration: BoxDecoration(
-                    color: card,
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(
-                      color: const Color(0xFF16A34A).withValues(alpha: 0.30),
-                    ),
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        t('Total Amount', 'মোট টাকা'),
-                        style: TextStyle(
-                          color: muted,
-                          fontWeight: FontWeight.w800,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '৳${_formatBdAmount(totalAmount)}',
-                        style: const TextStyle(
-                          color: Color(0xFF22C55E),
-                          fontWeight: FontWeight.w900,
-                          fontSize: 31,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _amountInWords,
-                        style: TextStyle(
-                          color: text,
-                          height: 1.4,
-                          fontWeight: FontWeight.w800,
-                          fontSize: 16,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: totalAmount > 0 ? _copy : null,
-                        icon: const Icon(Icons.copy_rounded),
-                        label: Text(t('Copy', 'কপি')),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: totalAmount > 0 ? _share : null,
-                        icon: const Icon(Icons.share_rounded),
-                        label: Text(t('Share', 'শেয়ার')),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                FilledButton.icon(
-                  onPressed: totalAmount > 0 ? _showBankSlip : null,
-                  icon: const Icon(Icons.receipt_long_rounded),
-                  label: Text(t('Bank Slip Summary', 'ব্যাংক স্লিপ সারাংশ')),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class BestBuyComparePage extends StatefulWidget {
-  final bool darkMode;
-  const BestBuyComparePage({super.key, required this.darkMode});
-
-  @override
-  State<BestBuyComparePage> createState() => _BestBuyComparePageState();
-}
-
-class _BestBuyComparePageState extends State<BestBuyComparePage> {
-  final aPrice = TextEditingController();
-  final aQty = TextEditingController();
-  final bPrice = TextEditingController();
-  final bQty = TextEditingController();
-
-  Color get bg =>
-      widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F4F5);
-  Color get card => widget.darkMode ? const Color(0xFF151517) : Colors.white;
-  Color get field =>
-      widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF2F2F7);
-  Color get text => widget.darkMode ? Colors.white : const Color(0xFF111111);
-  Color get muted =>
-      widget.darkMode ? const Color(0xFF8E8E93) : const Color(0xFF62626A);
-
-  double _v(TextEditingController c) =>
-      double.tryParse(c.text.replaceAll(',', '').trim()) ?? 0;
-  double get aUnit => _v(aQty) > 0 ? _v(aPrice) / _v(aQty) : 0;
-  double get bUnit => _v(bQty) > 0 ? _v(bPrice) / _v(bQty) : 0;
-  bool get ready => aUnit > 0 && bUnit > 0;
-  String money(double v) =>
-      v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(2);
-
-  @override
-  void dispose() {
-    aPrice.dispose();
-    aQty.dispose();
-    bPrice.dispose();
-    bQty.dispose();
-    super.dispose();
-  }
-
-  Widget _field(String label, TextEditingController controller, IconData icon) {
-    return TextField(
-      controller: controller,
-      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-      onChanged: (_) => setState(() {}),
-      style: TextStyle(color: text, fontWeight: FontWeight.w800),
-      decoration: InputDecoration(
-        labelText: label,
-        prefixIcon: Icon(icon, color: const Color(0xFF2563EB)),
-        filled: true,
-        fillColor: field,
-        border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(16),
-          borderSide: BorderSide.none,
-        ),
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final String winner = !ready
-        ? 'Enter both products'
-        : (aUnit < bUnit
-              ? 'Product A is better value'
-              : bUnit < aUnit
-              ? 'Product B is better value'
-              : 'Both cost the same per unit');
-    final double save = ready ? (aUnit - bUnit).abs() : 0;
-
-    return Scaffold(
-      backgroundColor: bg,
-      appBar: AppBar(
-        backgroundColor: bg,
-        foregroundColor: text,
-        title: const Text('Best Buy Compare'),
-      ),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 620),
-          child: ListView(
-            padding: const EdgeInsets.all(14),
-            children: [
-              Text(
-                'Compare two pack sizes and instantly see which is cheaper per unit.',
-                style: TextStyle(
-                  color: muted,
-                  fontWeight: FontWeight.w700,
-                  height: 1.4,
-                ),
-              ),
-              const SizedBox(height: 14),
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: card,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(
-                    color: widget.darkMode ? Colors.white10 : Colors.black12,
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    Text(
-                      'Product A',
-                      style: TextStyle(
-                        color: text,
-                        fontWeight: FontWeight.w900,
-                        fontSize: 17,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    _field('Price', aPrice, Icons.payments_outlined),
-                    const SizedBox(height: 8),
-                    _field('Quantity / weight', aQty, Icons.scale_outlined),
-                    if (aUnit > 0)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 10),
-                        child: Text(
-                          'Per unit: ৳${money(aUnit)}',
-                          style: const TextStyle(
-                            color: Color(0xFF2563EB),
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: card,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(
-                    color: widget.darkMode ? Colors.white10 : Colors.black12,
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    Text(
-                      'Product B',
-                      style: TextStyle(
-                        color: text,
-                        fontWeight: FontWeight.w900,
-                        fontSize: 17,
-                      ),
-                    ),
-                    const SizedBox(height: 10),
-                    _field('Price', bPrice, Icons.payments_outlined),
-                    const SizedBox(height: 8),
-                    _field('Quantity / weight', bQty, Icons.scale_outlined),
-                    if (bUnit > 0)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 10),
-                        child: Text(
-                          'Per unit: ৳${money(bUnit)}',
-                          style: const TextStyle(
-                            color: Color(0xFF2563EB),
-                            fontWeight: FontWeight.w900,
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(18),
-                decoration: BoxDecoration(
-                  color: card,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(
-                    color: const Color(
-                      0xFF16A34A,
-                    ).withValues(alpha: ready ? 0.35 : 0.12),
-                  ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      winner,
-                      style: TextStyle(
-                        color: ready ? const Color(0xFF16A34A) : muted,
-                        fontSize: 19,
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    if (ready && save > 0) ...[
-                      const SizedBox(height: 6),
-                      Text(
-                        'Difference: ৳${money(save)} per unit',
-                        style: TextStyle(
-                          color: muted,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class BillSplitPage extends StatefulWidget {
-  final bool darkMode;
-  const BillSplitPage({super.key, required this.darkMode});
-
-  @override
-  State<BillSplitPage> createState() => _BillSplitPageState();
-}
-
-class _BillSplitPageState extends State<BillSplitPage> {
-  final totalCtrl = TextEditingController();
-  final peopleCtrl = TextEditingController(text: '2');
-  final discountCtrl = TextEditingController();
-  final serviceCtrl = TextEditingController();
-
-  Color get bg =>
-      widget.darkMode ? const Color(0xFF000000) : const Color(0xFFF4F4F5);
-  Color get card => widget.darkMode ? const Color(0xFF151517) : Colors.white;
-  Color get field =>
-      widget.darkMode ? const Color(0xFF1C1C1E) : const Color(0xFFF2F2F7);
-  Color get text => widget.darkMode ? Colors.white : const Color(0xFF111111);
-  Color get muted =>
-      widget.darkMode ? const Color(0xFF8E8E93) : const Color(0xFF62626A);
-
-  double _v(TextEditingController c) =>
-      double.tryParse(c.text.replaceAll(',', '').trim()) ?? 0;
-  int get people => int.tryParse(peopleCtrl.text.trim()) ?? 0;
-  double get adjustedTotal {
-    final base = _v(totalCtrl);
-    final afterDiscount = base - (base * _v(discountCtrl) / 100);
-    return afterDiscount + (afterDiscount * _v(serviceCtrl) / 100);
-  }
-
-  double get perPerson => people > 0 ? adjustedTotal / people : 0;
-  String money(double v) =>
-      v % 1 == 0 ? v.toInt().toString() : v.toStringAsFixed(2);
-
-  @override
-  void dispose() {
-    totalCtrl.dispose();
-    peopleCtrl.dispose();
-    discountCtrl.dispose();
-    serviceCtrl.dispose();
-    super.dispose();
-  }
-
-  Widget _field(String label, TextEditingController c, IconData icon) =>
-      TextField(
-        controller: c,
-        keyboardType: const TextInputType.numberWithOptions(decimal: true),
-        onChanged: (_) => setState(() {}),
-        style: TextStyle(color: text, fontWeight: FontWeight.w800),
-        decoration: InputDecoration(
-          labelText: label,
-          prefixIcon: Icon(icon, color: const Color(0xFF0F766E)),
-          filled: true,
-          fillColor: field,
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(16),
-            borderSide: BorderSide.none,
-          ),
-        ),
-      );
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: bg,
-      appBar: AppBar(
-        backgroundColor: bg,
-        foregroundColor: text,
-        title: const Text('Smart Bill Split'),
-      ),
-      body: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 620),
-          child: ListView(
-            padding: const EdgeInsets.all(14),
-            children: [
-              Container(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: card,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(
-                    color: widget.darkMode ? Colors.white10 : Colors.black12,
-                  ),
-                ),
-                child: Column(
-                  children: [
-                    _field('Total bill', totalCtrl, Icons.receipt_long_rounded),
-                    const SizedBox(height: 9),
-                    _field('People', peopleCtrl, Icons.groups_rounded),
-                    const SizedBox(height: 9),
-                    _field(
-                      'Discount % (optional)',
-                      discountCtrl,
-                      Icons.percent_rounded,
-                    ),
-                    const SizedBox(height: 9),
-                    _field(
-                      'Service / tip % (optional)',
-                      serviceCtrl,
-                      Icons.room_service_rounded,
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(18),
-                decoration: BoxDecoration(
-                  color: card,
-                  borderRadius: BorderRadius.circular(22),
-                  border: Border.all(
-                    color: const Color(0xFF0F766E).withValues(alpha: 0.30),
-                  ),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Final total: ৳${money(adjustedTotal)}',
-                      style: TextStyle(
-                        color: muted,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 16,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      'Each person: ৳${money(perPerson)}',
-                      style: const TextStyle(
-                        color: Color(0xFF0F766E),
-                        fontWeight: FontWeight.w900,
-                        fontSize: 26,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
   }
 }
 

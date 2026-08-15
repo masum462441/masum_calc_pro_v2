@@ -1,5 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'hisabflow_theme.dart';
 
 class PackPriceCalculatorPage extends StatefulWidget {
   final bool darkMode;
@@ -12,6 +15,7 @@ class PackPriceCalculatorPage extends StatefulWidget {
 }
 
 class _PackPriceCalculatorPageState extends State<PackPriceCalculatorPage> {
+  static const String _languageKey = 'pack_price_bangla_ui_v1';
   final TextEditingController boxPriceCtrl = TextEditingController();
   final TextEditingController totalPcsCtrl = TextEditingController();
   final TextEditingController pcsPerStripCtrl = TextEditingController();
@@ -19,28 +23,48 @@ class _PackPriceCalculatorPageState extends State<PackPriceCalculatorPage> {
 
   bool bangla = false;
 
-  Color get bg =>
-      widget.darkMode ? const Color(0xFF050505) : const Color(0xFFF7FBFF);
-  Color get card => widget.darkMode ? const Color(0xFF151517) : Colors.white;
-  Color get field =>
-      widget.darkMode ? const Color(0xFF242426) : const Color(0xFFEAF1FA);
+  Color get bg => widget.darkMode
+      ? HisabFlowColors.darkBackground
+      : HisabFlowColors.lightBackground;
+  Color get card => widget.darkMode
+      ? HisabFlowColors.darkSurface
+      : HisabFlowColors.lightSurface;
+  Color get field => widget.darkMode
+      ? HisabFlowColors.darkSurface2
+      : HisabFlowColors.lightSurface2;
   Color get mainText =>
-      widget.darkMode ? Colors.white : const Color(0xFF071323);
+      widget.darkMode ? HisabFlowColors.darkText : HisabFlowColors.lightText;
   Color get mutedText =>
-      widget.darkMode ? Colors.white70 : const Color(0xFF5C6470);
-  Color get orange => const Color(0xFFFFA31A);
-  Color get green => const Color(0xFF30C96B);
-  Color get red => const Color(0xFFFF5A5A);
-  Color get cyan => const Color(0xFF22D3EE);
+      widget.darkMode ? HisabFlowColors.darkMuted : HisabFlowColors.lightMuted;
+  Color get orange => HisabFlowColors.orange;
+  Color get green => HisabFlowColors.green;
+  Color get red => HisabFlowColors.red;
+  Color get cyan => HisabFlowColors.cyan;
 
   @override
   void initState() {
     super.initState();
+    _loadLanguage();
     pcsPerStripCtrl.text = '10';
     boxPriceCtrl.addListener(_refresh);
     totalPcsCtrl.addListener(_refresh);
     pcsPerStripCtrl.addListener(_refresh);
     profitCtrl.addListener(_refresh);
+  }
+
+  Future<void> _loadLanguage() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getBool(_languageKey) ?? false;
+    if (!mounted || saved == bangla) return;
+    setState(() => bangla = saved);
+  }
+
+  Future<void> _toggleLanguage() async {
+    HapticFeedback.selectionClick();
+    final next = !bangla;
+    setState(() => bangla = next);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_languageKey, next);
   }
 
   @override
@@ -139,7 +163,7 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
         ),
         actions: [
           TextButton(
-            onPressed: () => setState(() => bangla = !bangla),
+            onPressed: _toggleLanguage,
             child: Text(
               bangla ? 'EN' : 'বাংলা',
               style: TextStyle(color: orange, fontWeight: FontWeight.w900),
@@ -153,21 +177,27 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
         ],
       ),
       body: Center(
-        child: Container(
-          width: MediaQuery.of(context).size.width > 700
-              ? 460
-              : double.infinity,
-          padding: const EdgeInsets.fromLTRB(14, 8, 14, 24),
-          child: ListView(
-            children: [
-              _topInfoCard(),
-              const SizedBox(height: 14),
-              _inputCard(),
-              const SizedBox(height: 14),
-              _resultCard(),
-              const SizedBox(height: 14),
-              _exampleCard(),
-            ],
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 680),
+          child: Padding(
+            padding: EdgeInsets.fromLTRB(
+              HisabFlowResponsive.horizontalPadding(context),
+              8,
+              HisabFlowResponsive.horizontalPadding(context),
+              24,
+            ),
+            child: ListView(
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              children: [
+                _topInfoCard(),
+                const SizedBox(height: 14),
+                _inputCard(),
+                const SizedBox(height: 14),
+                _resultCard(),
+                const SizedBox(height: 14),
+                _exampleCard(),
+              ],
+            ),
           ),
         ),
       ),
@@ -178,13 +208,11 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        gradient: const LinearGradient(
-          colors: [Color(0xFFFFA31A), Color(0xFFFF7C00)],
-        ),
+        gradient: HisabFlowColors.brandGradient,
         borderRadius: BorderRadius.circular(26),
         boxShadow: [
           BoxShadow(
-            color: orange.withOpacity(0.25),
+            color: orange.withValues(alpha: 0.25),
             blurRadius: 18,
             offset: const Offset(0, 10),
           ),
@@ -196,7 +224,7 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
             height: 54,
             width: 54,
             decoration: BoxDecoration(
-              color: Colors.white.withOpacity(0.22),
+              color: Colors.white.withValues(alpha: 0.22),
               borderRadius: BorderRadius.circular(20),
             ),
             child: const Icon(Icons.inventory_2_rounded, color: Colors.white),
@@ -241,8 +269,8 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
         borderRadius: BorderRadius.circular(24),
         border: Border.all(
           color: widget.darkMode
-              ? Colors.white.withOpacity(0.08)
-              : Colors.black.withOpacity(0.05),
+              ? Colors.white.withValues(alpha: 0.08)
+              : Colors.black.withValues(alpha: 0.05),
         ),
       ),
       child: Column(
@@ -267,8 +295,46 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
           const SizedBox(height: 10),
           _input(
             controller: profitCtrl,
-            label: t('Profit % optional', 'লাভ % optional'),
+            label: t('Profit % optional', 'লাভ % (ঐচ্ছিক)'),
             icon: Icons.trending_up_rounded,
+          ),
+          const SizedBox(height: 10),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: Text(
+              t('Quick profit', 'দ্রুত লাভ %'),
+              style: TextStyle(
+                color: mutedText,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [0, 5, 10, 15, 20].map((percent) {
+              final selected = profitPercent == percent;
+              return ChoiceChip(
+                selected: selected,
+                label: Text(percent == 0 ? t('None', 'নেই') : '$percent%'),
+                onSelected: (_) {
+                  HapticFeedback.selectionClick();
+                  profitCtrl.text = percent == 0 ? '' : percent.toString();
+                },
+                selectedColor: HisabFlowColors.primary.withValues(alpha: 0.18),
+                side: BorderSide(
+                  color: selected
+                      ? HisabFlowColors.primary.withValues(alpha: 0.45)
+                      : mutedText.withValues(alpha: 0.18),
+                ),
+                labelStyle: TextStyle(
+                  color: selected ? HisabFlowColors.primaryLight : mainText,
+                  fontWeight: FontWeight.w800,
+                ),
+              );
+            }).toList(),
           ),
         ],
       ),
@@ -282,10 +348,18 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
   }) {
     return TextField(
       controller: controller,
-      keyboardType: TextInputType.number,
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9.,]'))],
       style: TextStyle(color: mainText, fontWeight: FontWeight.w800),
       decoration: InputDecoration(
-        prefixIcon: Icon(icon, color: orange),
+        prefixIcon: Icon(icon, color: HisabFlowColors.primary),
+        suffixIcon: controller.text.isEmpty
+            ? null
+            : IconButton(
+                tooltip: t('Clear', 'মুছুন'),
+                onPressed: controller.clear,
+                icon: Icon(Icons.close_rounded, color: mutedText, size: 18),
+              ),
         labelText: label,
         labelStyle: TextStyle(color: mutedText),
         filled: true,
@@ -306,8 +380,8 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
         borderRadius: BorderRadius.circular(24),
         border: Border.all(
           color: hasBasicInput
-              ? green.withOpacity(0.35)
-              : Colors.white.withOpacity(0.06),
+              ? green.withValues(alpha: 0.35)
+              : Colors.white.withValues(alpha: 0.06),
         ),
       ),
       child: Column(
@@ -342,7 +416,7 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
           ),
           if (profitPercent > 0) ...[
             const SizedBox(height: 8),
-            Divider(color: mutedText.withOpacity(0.25)),
+            Divider(color: mutedText.withValues(alpha: 0.25)),
             _resultRow(
               icon: Icons.sell_rounded,
               title: t('1 Pcs Sale Price', '১ পিস বিক্রয় দাম'),
@@ -365,7 +439,7 @@ ${t('1 Strip/Pata Sale Price', '১ পাতা/স্ট্রিপ বিক
             height: 48,
             child: ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
-                backgroundColor: orange,
+                backgroundColor: HisabFlowColors.primary,
                 foregroundColor: Colors.white,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(18),
